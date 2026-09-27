@@ -303,11 +303,12 @@ pub fn ECSTable(comptime table_id: u32) type {
 
         /// Registers a component type. Creates one column sized to the
         /// current row count, all flags inactive, payload bytes zeroed.
-        /// Duplicate registration is an error, not a silent no-op.
-        pub fn addComponent(alloc: Allocator, comptime T: type) Error!void {
+        /// Returns `true` if the component was registered, `false` if it
+        /// was already registered (idempotent no-op).
+        pub fn addComponent(alloc: Allocator, comptime T: type) Error!bool {
             if (!initialized) return Error.NotInitialized;
             if (hasFields(T)) {
-                if (data_map.contains(@typeName(T))) return Error.ComponentAlreadyExists;
+                if (data_map.contains(@typeName(T))) return false;
                 const rows: usize = destroyed.bitset.bits_count;
                 try data_cols.append(alloc, DataColumn{
                     .name = try alloc.dupe(u8, @typeName(T)),
@@ -324,7 +325,7 @@ pub fn ECSTable(comptime table_id: u32) type {
                 try dataEnsureRows(alloc, col, rows);
                 try data_map.put(alloc, col.name, @intCast(data_cols.items.len - 1));
             } else {
-                if (flag_map.contains(@typeName(T))) return Error.ComponentAlreadyExists;
+                if (flag_map.contains(@typeName(T))) return false;
                 const rows: usize = destroyed.bitset.bits_count;
                 try flag_cols.append(alloc, FlagColumn{
                     .name = try alloc.dupe(u8, @typeName(T)),
@@ -338,14 +339,17 @@ pub fn ECSTable(comptime table_id: u32) type {
                 try col.tree.resize(alloc, @intCast(rows), .inactive);
                 try flag_map.put(alloc, col.name, @intCast(flag_cols.items.len - 1));
             }
+            return true;
         }
 
         /// Unregisters a component type. Removes its column with swap-remove
         /// and repoints the map entry of the moved column by its stored name.
-        pub fn removeComponent(alloc: Allocator, comptime T: type) Error!void {
+        /// Returns `true` if the component was removed, `false` if it was
+        /// not registered (idempotent no-op).
+        pub fn removeComponent(alloc: Allocator, comptime T: type) Error!bool {
             if (!initialized) return Error.NotInitialized;
             if (hasFields(T)) {
-                const idx = data_map.get(@typeName(T)) orelse return Error.ComponentNotFound;
+                const idx = data_map.get(@typeName(T)) orelse return false;
                 _ = data_map.remove(@typeName(T));
                 var gone = data_cols.swapRemove(idx);
                 if (idx < data_cols.items.len) {
@@ -353,7 +357,7 @@ pub fn ECSTable(comptime table_id: u32) type {
                 }
                 freeDataColumn(alloc, &gone);
             } else {
-                const idx = flag_map.get(@typeName(T)) orelse return Error.ComponentNotFound;
+                const idx = flag_map.get(@typeName(T)) orelse return false;
                 _ = flag_map.remove(@typeName(T));
                 var gone = flag_cols.swapRemove(idx);
                 if (idx < flag_cols.items.len) {
@@ -362,6 +366,7 @@ pub fn ECSTable(comptime table_id: u32) type {
                 gone.tree.deinit(alloc);
                 alloc.free(gone.name);
             }
+            return true;
         }
 
         /// Checks registration in the matching map, chosen at comptime.
@@ -918,29 +923,29 @@ test "ECSTable columns: add/remove/contain with swap remap" {
     defer T.deinit(t.allocator);
 
     try t.expect(!T.containComponent(Pos));
-    try T.addComponent(t.allocator, Pos);
-    try T.addComponent(t.allocator, Vel);
-    try T.addComponent(t.allocator, Tag);
+    try t.expect(try T.addComponent(t.allocator, Pos));
+    try t.expect(try T.addComponent(t.allocator, Vel));
+    try t.expect(try T.addComponent(t.allocator, Tag));
     try t.expect(T.containComponent(Pos));
     try t.expect(T.containComponent(Vel));
     try t.expect(T.containComponent(Tag));
     try t.expect(!T.containComponent(Health));
-    try t.expectError(T.Error.ComponentAlreadyExists, T.addComponent(t.allocator, Pos));
-    try t.expectError(T.Error.ComponentAlreadyExists, T.addComponent(t.allocator, Tag));
+    try t.expect(!try T.addComponent(t.allocator, Pos));
+    try t.expect(!try T.addComponent(t.allocator, Tag));
 
     const e = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 2 }, Vel{ .dx = 3, .dy = 4 } });
     try t.expectEqual(Pos{ .x = 1, .y = 2 }, try e.getComponent(Pos));
 
-    try T.removeComponent(t.allocator, Pos);
+    try t.expect(try T.removeComponent(t.allocator, Pos));
     try t.expect(!T.containComponent(Pos));
     try t.expect(T.containComponent(Vel));
-    try t.expectError(T.Error.ComponentNotFound, T.removeComponent(t.allocator, Pos));
+    try t.expect(!try T.removeComponent(t.allocator, Pos));
     try t.expectError(T.Error.ComponentNotFound, e.getComponent(Pos));
     try t.expectEqual(Vel{ .dx = 3, .dy = 4 }, try e.getComponent(Vel));
 
-    try T.removeComponent(t.allocator, Tag);
+    try t.expect(try T.removeComponent(t.allocator, Tag));
     try t.expect(!T.containComponent(Tag));
-    try T.addComponent(t.allocator, Pos);
+    try t.expect(try T.addComponent(t.allocator, Pos));
     try t.expect(T.containComponent(Pos));
 }
 
@@ -952,7 +957,7 @@ test "ECSTable columns: late add sizes rows, get/set/ptr roundtrip" {
     const a = try T.create(t.allocator, .{});
     const b = try T.create(t.allocator, .{});
     const c = try T.create(t.allocator, .{});
-    try T.addComponent(t.allocator, Health);
+    _ = try T.addComponent(t.allocator, Health);
     try t.expectEqual(@as(u32, 3), T.rowCount());
 
     try a.setComponent(Health{ .hp = 10 });
@@ -974,10 +979,10 @@ test "ECSTable create tuple: payloads, flags, missing type" {
     try T.init();
     defer T.deinit(t.allocator);
 
-    try T.addComponent(t.allocator, Pos);
-    try T.addComponent(t.allocator, Vel);
-    try T.addComponent(t.allocator, Health);
-    try T.addComponent(t.allocator, Tag);
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.addComponent(t.allocator, Health);
+    _ = try T.addComponent(t.allocator, Tag);
 
     const e = try T.create(t.allocator, .{ Pos{ .x = 5, .y = 6 }, Vel{ .dx = 7, .dy = 8 } });
     try t.expect(try e.isComponentActive(Pos));
@@ -1002,7 +1007,7 @@ test "ECSTable clearDestroyed: swap-remove moves data and seals slots" {
     try T.init();
     defer T.deinit(t.allocator);
 
-    try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Pos);
     var refs: [5]T.EntityReference = undefined;
     var i: u32 = 0;
     while (i < 5) : (i += 1) {
@@ -1053,9 +1058,9 @@ test "ECSTable Query: truth table, idioms, direction, range, filters" {
     try T.init();
     defer T.deinit(t.allocator);
 
-    try T.addComponent(t.allocator, Pos);
-    try T.addComponent(t.allocator, Vel);
-    try T.addComponent(t.allocator, Tag);
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.addComponent(t.allocator, Tag);
 
     const r0 = try T.create(t.allocator, .{Pos{ .x = 0, .y = 0 }});
     const r1 = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 1 }, Vel{ .dx = 1, .dy = 1 } });
