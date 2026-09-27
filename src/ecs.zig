@@ -423,7 +423,22 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// components in the tuple are comptime errors. Every listed type
         /// must be registered; listed columns start active with copied
         /// payloads, every other column starts inactive on the new row.
+        /// `values` must be a tuple even for a single component:
+        /// `create(alloc, .{ Transform{ .scale = ... } })`.
         pub fn create(alloc: Allocator, comptime values: anytype) Error!EntityReference {
+            const V = @TypeOf(values);
+            const ti = @typeInfo(V);
+            if (ti != .@"struct" or !ti.@"struct".is_tuple) {
+                @compileError("ECSTable.create(alloc, values): `values` must be a tuple of component values, e.g. `.{ Transform{ .scale = ... } }`; got `" ++ @typeName(V) ++ "`. Hint: wrap even a single component value in `.{ ... }`.");
+            } else {
+                return createChecked(alloc, values);
+            }
+        }
+
+        /// Checked body of `create`: `values` are known to be a tuple here,
+        /// so the `inline for` loops below never see a mistyped argument and
+        /// no cascading errors are reported after the gate above.
+        fn createChecked(alloc: Allocator, comptime values: anytype) Error!EntityReference {
             if (!initialized) return Error.NotInitialized;
             validateTuple(values);
             inline for (values) |v| {
@@ -452,11 +467,18 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// Creates `n` entities from the same tuple, invoking `cb` with
         /// each fresh handle. Handles stream through the comptime callback
         /// one by one, no handle array is ever allocated.
+        /// `values` must be a tuple even for a single component.
         pub fn createN(alloc: Allocator, comptime values: anytype, n: u32, context: anytype, comptime cb: fn (@TypeOf(context), EntityReference) void) Error!void {
-            if (!initialized) return Error.NotInitialized;
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                cb(context, try create(alloc, values));
+            const V = @TypeOf(values);
+            const ti = @typeInfo(V);
+            if (ti != .@"struct" or !ti.@"struct".is_tuple) {
+                @compileError("ECSTable.createN(alloc, values, n, ...): `values` must be a tuple of component values, e.g. `.{ Transform{ .scale = ... } }`; got `" ++ @typeName(V) ++ "`. Hint: wrap even a single component value in `.{ ... }`.");
+            } else {
+                if (!initialized) return Error.NotInitialized;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    cb(context, try create(alloc, values));
+                }
             }
         }
 
@@ -538,6 +560,29 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// across `clearDestroyed`, and handle resolution per row is wasteful.
         /// To name a visited row afterwards, call `rowToEntity` explicitly.
         pub fn Query(
+            comptime Includes: anytype,
+            comptime Excludes: anytype,
+            comptime direction: bit_tree.Direction,
+            comptime Context: type,
+            comptime on_row: fn (ctx: Context, row: u32) callconv(.@"inline") bool,
+        ) type {
+            const IT = @TypeOf(Includes);
+            const iti = @typeInfo(IT);
+            const ET = @TypeOf(Excludes);
+            const eti = @typeInfo(ET);
+            if (iti != .@"struct" or !iti.@"struct".is_tuple) {
+                @compileError("ECSTable.Query(Includes, Excludes, ...): `Includes` must be a tuple of component types, e.g. `.{ Transform }` (empty `.{}` selects all rows); got `" ++ @typeName(IT) ++ "`." ++ if (IT == type) " Hint: pass the type wrapped in a tuple: `.{ Transform }`, not bare `Transform`." else "");
+            } else if (eti != .@"struct" or !eti.@"struct".is_tuple) {
+                @compileError("ECSTable.Query(Includes, Excludes, ...): `Excludes` must be a tuple of component types, e.g. `.{ Health }` (empty `.{}` excludes nothing); got `" ++ @typeName(ET) ++ "`." ++ if (ET == type) " Hint: pass the type wrapped in a tuple: `.{ Health}`, not bare `Health`." else "");
+            } else {
+                return queryChecked(Includes, Excludes, direction, Context, on_row);
+            }
+        }
+
+        /// Checked body of `Query`: both sides are known tuples here, so the
+        /// `.len` accesses and `inline for` loops below never see a mistyped
+        /// argument and no cascading errors are reported after the gate above.
+        fn queryChecked(
             comptime Includes: anytype,
             comptime Excludes: anytype,
             comptime direction: bit_tree.Direction,
