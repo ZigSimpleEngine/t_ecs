@@ -430,7 +430,7 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// payloads, every other column starts inactive on the new row.
         /// `values` must be a tuple even for a single component:
         /// `create(alloc, .{ Transform{ .scale = ... } })`.
-        pub fn create(alloc: Allocator, comptime values: anytype) Error!EntityReference {
+        pub fn create(alloc: Allocator, values: anytype) Error!EntityReference {
             const V = @TypeOf(values);
             const ti = @typeInfo(V);
             if (ti != .@"struct" or !ti.@"struct".is_tuple) {
@@ -443,7 +443,7 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// Checked body of `create`: `values` are known to be a tuple here,
         /// so the `inline for` loops below never see a mistyped argument and
         /// no cascading errors are reported after the gate above.
-        fn createChecked(alloc: Allocator, comptime values: anytype) Error!EntityReference {
+        fn createChecked(alloc: Allocator, values: anytype) Error!EntityReference {
             if (!initialized) return Error.NotInitialized;
             validateTuple(values);
             inline for (values) |v| {
@@ -473,7 +473,7 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// each fresh handle. Handles stream through the comptime callback
         /// one by one, no handle array is ever allocated.
         /// `values` must be a tuple even for a single component.
-        pub fn createN(alloc: Allocator, comptime values: anytype, n: u32, context: anytype, comptime cb: fn (@TypeOf(context), EntityReference) void) Error!void {
+        pub fn createN(alloc: Allocator, values: anytype, n: u32, context: anytype, comptime cb: fn (@TypeOf(context), EntityReference) void) Error!void {
             const V = @TypeOf(values);
             const ti = @typeInfo(V);
             if (ti != .@"struct" or !ti.@"struct".is_tuple) {
@@ -687,7 +687,7 @@ pub fn ECSTable(comptime table_id: u32) type {
 
         /// Comptime shape check of a create tuple: tuple-ness, struct
         /// payload values only, no duplicate types.
-        fn validateTuple(comptime values: anytype) void {
+        fn validateTuple(values: anytype) void {
             const ti = @typeInfo(@TypeOf(values));
             if (ti != .@"struct" or !ti.@"struct".is_tuple) @compileError("create expects a tuple of component values");
             inline for (ti.@"struct".fields, 0..) |f, k| {
