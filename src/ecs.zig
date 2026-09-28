@@ -571,29 +571,6 @@ pub fn ECSTable(comptime table_id: u32) type {
             comptime Context: type,
             comptime on_row: fn (ctx: Context, row: u32) callconv(.@"inline") bool,
         ) type {
-            const IT = @TypeOf(Includes);
-            const iti = @typeInfo(IT);
-            const ET = @TypeOf(Excludes);
-            const eti = @typeInfo(ET);
-            if (iti != .@"struct" or !iti.@"struct".is_tuple) {
-                @compileError("ECSTable.Query(Includes, Excludes, ...): `Includes` must be a tuple of component types, e.g. `.{ Transform }` (empty `.{}` selects all rows); got `" ++ @typeName(IT) ++ "`." ++ if (IT == type) " Hint: pass the type wrapped in a tuple: `.{ Transform }`, not bare `Transform`." else "");
-            } else if (eti != .@"struct" or !eti.@"struct".is_tuple) {
-                @compileError("ECSTable.Query(Includes, Excludes, ...): `Excludes` must be a tuple of component types, e.g. `.{ Health }` (empty `.{}` excludes nothing); got `" ++ @typeName(ET) ++ "`." ++ if (ET == type) " Hint: pass the type wrapped in a tuple: `.{ Health}`, not bare `Health`." else "");
-            } else {
-                return queryChecked(Includes, Excludes, direction, Context, on_row);
-            }
-        }
-
-        /// Checked body of `Query`: both sides are known tuples here, so the
-        /// `.len` accesses and `inline for` loops below never see a mistyped
-        /// argument and no cascading errors are reported after the gate above.
-        fn queryChecked(
-            comptime Includes: anytype,
-            comptime Excludes: anytype,
-            comptime direction: bit_tree.Direction,
-            comptime Context: type,
-            comptime on_row: fn (ctx: Context, row: u32) callconv(.@"inline") bool,
-        ) type {
             comptime validateQuery(Includes, Excludes);
             const IL = Includes.len;
             const EL = Excludes.len;
@@ -632,10 +609,16 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// Comptime shape check of a query: both sides are tuples of struct
         /// types with no duplicates inside or across the tuple pair.
         fn validateQuery(Includes: anytype, Excludes: anytype) void {
-            const iti = @typeInfo(@TypeOf(Includes));
-            const eti = @typeInfo(@TypeOf(Excludes));
-            if (iti != .@"struct" or !iti.@"struct".is_tuple) @compileError("Includes must be a tuple of component types");
-            if (eti != .@"struct" or !eti.@"struct".is_tuple) @compileError("Excludes must be a tuple of component types");
+            const IT = @TypeOf(Includes);
+            const iti = @typeInfo(IT);
+            const ET = @TypeOf(Excludes);
+            const eti = @typeInfo(ET);
+            if (iti != .@"struct" or !iti.@"struct".is_tuple) {
+                @compileError("ECSTable.Query(Includes, Excludes, ...): `Includes` must be a tuple of component types, e.g. `.{ Transform }` (empty `.{}` selects all rows); got `" ++ @typeName(IT) ++ "`." ++ if (IT == type) " Hint: pass the type wrapped in a tuple: `.{ Transform }`, not bare `Transform`." else "");
+            } else if (eti != .@"struct" or !eti.@"struct".is_tuple) {
+                @compileError("ECSTable.Query(Includes, Excludes, ...): `Excludes` must be a tuple of component types, e.g. `.{ Health }` (empty `.{}` excludes nothing); got `" ++ @typeName(ET) ++ "`." ++ if (ET == type) " Hint: pass the type wrapped in a tuple: `.{ Health}`, not bare `Health`." else "");
+            }
+
             inline for (0..iti.@"struct".fields.len) |k| checkQueryType(Includes[k]);
             inline for (0..eti.@"struct".fields.len) |k| checkQueryType(Excludes[k]);
             inline for (0..iti.@"struct".fields.len) |i| {
