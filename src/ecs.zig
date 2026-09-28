@@ -499,7 +499,9 @@ pub fn ECSTable(comptime table_id: u32) type {
             {
                 var ctx = VictimCtx{ .list = &victims, .alloc = alloc };
                 const It = Tree.Iterator(*VictimCtx, VictimCtx.push, null, .forward);
-                _ = It.iterateAll(.{ .tree = &destroyed, .context = &ctx }, null, null);
+                // Victim/Donor push callbacks never fail: OOM is reported
+                // via the ctx flag, so unwrapping here is safe.
+                _ = It.iterateAll(.{ .tree = &destroyed, .context = &ctx }, null, null) catch unreachable;
                 if (ctx.oom) return Error.OutOfMemory;
             }
             if (victims.items.len == 0) return;
@@ -514,7 +516,8 @@ pub fn ECSTable(comptime table_id: u32) type {
             if (need > 0) {
                 var ctx = DonorCtx{ .list = &donors, .alloc = alloc, .need = need };
                 const It = Tree.Iterator(*DonorCtx, null, DonorCtx.push, .backward);
-                _ = It.iterateAll(.{ .tree = &destroyed, .context = &ctx }, live, null);
+                // Donor push never fails (OOM via ctx flag), unwrapping is safe.
+                _ = It.iterateAll(.{ .tree = &destroyed, .context = &ctx }, live, null) catch unreachable;
                 if (ctx.oom) return Error.OutOfMemory;
                 std.debug.assert(donors.items.len == need);
             }
@@ -569,15 +572,17 @@ pub fn ECSTable(comptime table_id: u32) type {
             comptime Excludes: anytype,
             comptime direction: bit_tree.Direction,
             comptime Context: type,
-            comptime on_row: fn (ctx: Context, row: u32) callconv(.@"inline") bool,
+            comptime on_row: fn (ctx: Context, row: u32) callconv(.@"inline") anyerror!bool,
         ) type {
             comptime validateQuery(Includes, Excludes);
             const IL = Includes.len;
             const EL = Excludes.len;
             return struct {
                 /// Runs the match over an optional bit range with an optional
-                /// entity activity filter. Returns false on early callback exit.
-                pub fn iterateAll(ctx: Context, start_bit: ?u32, end_bit: ?u32, entity_activity: ?bool) Error!bool {
+                /// entity activity filter. Returns false on early callback
+                /// exit (`on_row` returned false); a `try` inside `on_row`
+                /// aborts the walk with that error instead.
+                pub fn iterateAll(ctx: Context, start_bit: ?u32, end_bit: ?u32, entity_activity: ?bool) anyerror!bool {
                     if (!initialized) return Error.NotInitialized;
                     var inc: [IL]*Tree = undefined;
                     inline for (Includes, 0..) |C, k| inc[k] = try Table.componentTree(C);
@@ -689,7 +694,7 @@ pub fn ECSTable(comptime table_id: u32) type {
             alloc: Allocator,
             oom: bool = false,
 
-            inline fn push(ctx: *VictimCtx, id: u32) bool {
+            inline fn push(ctx: *VictimCtx, id: u32) anyerror!bool {
                 ctx.list.append(ctx.alloc, id) catch {
                     ctx.oom = true;
                     return false;
@@ -706,7 +711,7 @@ pub fn ECSTable(comptime table_id: u32) type {
             need: usize,
             oom: bool = false,
 
-            inline fn push(ctx: *DonorCtx, id: u32) bool {
+            inline fn push(ctx: *DonorCtx, id: u32) anyerror!bool {
                 ctx.list.append(ctx.alloc, id) catch {
                     ctx.oom = true;
                     return false;
@@ -758,7 +763,8 @@ pub fn ECSTable(comptime table_id: u32) type {
         fn allocRow(alloc: Allocator) Error!u32 {
             var finder = ReuseCtx{};
             const It = Tree.Iterator(*ReuseCtx, ReuseCtx.push, null, .forward);
-            _ = It.iterateAll(.{ .tree = &destroyed, .context = &finder }, null, null);
+            // ReuseCtx.push never fails (pure early-exit scan), so unwrapping is safe.
+            _ = It.iterateAll(.{ .tree = &destroyed, .context = &finder }, null, null) catch unreachable;
             if (finder.row) |row| return row;
             const row = destroyed.bitset.bits_count;
             try destroyed.resize(alloc, row + 1, .inactive);
@@ -778,7 +784,7 @@ pub fn ECSTable(comptime table_id: u32) type {
         const ReuseCtx = struct {
             row: ?u32 = null,
 
-            inline fn push(ctx: *ReuseCtx, id: u32) bool {
+            inline fn push(ctx: *ReuseCtx, id: u32) anyerror!bool {
                 ctx.row = id;
                 return false;
             }
@@ -1029,7 +1035,7 @@ const Collect = struct {
     rows: [16]u32 = undefined,
     n: usize = 0,
 
-    inline fn push(self: *Collect, row: u32) bool {
+    inline fn push(self: *Collect, row: u32) anyerror!bool {
         self.rows[self.n] = row;
         self.n += 1;
         return true;
@@ -1113,4 +1119,47 @@ test "ECSTable Query: truth table, idioms, direction, range, filters" {
     try t.expect(r3.isValid());
     try t.expect(r4.isValid());
     try t.expect(!r5.isValid());
+}
+
+const FallibleCollect = struct {
+    rows: [16]u32 = undefined,
+    n: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+
+    inline fn push(self: *FallibleCollect, row: u32) anyerror!bool {
+        if (self.n == self.fail_at) return error.RowCallbackFailed;
+        self.rows[self.n] = row;
+        self.n += 1;
+        return true;
+    }
+};
+
+test "ECSTable Query fallible: try inside on_row aborts with that error" {
+    const T = ECSTable(206);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.create(t.allocator, .{Pos{ .x = 0, .y = 0 }});
+    _ = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 1 }, Vel{ .dx = 1, .dy = 1 } });
+    _ = try T.create(t.allocator, .{Pos{ .x = 2, .y = 2 }});
+
+    const Q = T.Query(.{Pos}, .{}, .forward, *FallibleCollect, FallibleCollect.push);
+
+    // User error aborts the walk and propagates through iterateAll.
+    var c = FallibleCollect{ .fail_at = 2 };
+    try t.expectError(error.RowCallbackFailed, Q.iterateAll(&c, null, null, null));
+    try t.expectEqual(@as(usize, 2), c.n);
+
+    // Backward walk aborts the same way.
+    const QB = T.Query(.{Pos}, .{}, .backward, *FallibleCollect, FallibleCollect.push);
+    var cb = FallibleCollect{ .fail_at = 1 };
+    try t.expectError(error.RowCallbackFailed, QB.iterateAll(&cb, null, null, null));
+    try t.expectEqual(@as(usize, 1), cb.n);
+
+    // No failure: full walk completes with true.
+    var ok = FallibleCollect{};
+    try t.expect(try Q.iterateAll(&ok, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ok.rows[0..ok.n]);
 }
