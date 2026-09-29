@@ -51,11 +51,18 @@ pub fn ECSTable(comptime table_id: u32) type {
         };
 
         /// Flag-only component column. No payload, just activity flags.
+        /// `dummy` provides a stable address for `getComponentPtr` on flag
+        /// types: empty structs carry no bytes, so every row of one flag
+        /// shares this single byte. Writes through the pointer are no-ops;
+        /// activity is tracked only in `tree`. Never compare pointers for
+        /// row identity and never store them across `removeComponent`.
         const FlagColumn = struct {
             /// Owned `@typeName(T)` copy, map key for the column.
             name: []u8,
             /// Per-row activity flags.
             tree: Tree = .{},
+            /// Shared addressable byte for flag `getComponentPtr`.
+            dummy: u8 = 0,
         };
 
         /// Failure modes of table operations, including allocator failures.
@@ -111,17 +118,20 @@ pub fn ECSTable(comptime table_id: u32) type {
             }
 
             /// Copies the component payload out of the entity row.
+            /// Flag components return `T{}`.
             pub fn getComponent(self: EntityReference, comptime T: type) Error!T {
                 return Row.getComponent(try Table.resolveRef(self), T);
             }
 
             /// Returns a mutable pointer into the entity row payload.
+            /// Flag components share one address per column, writes are no-ops.
             pub fn getComponentPtr(self: EntityReference, comptime T: type) Error!*T {
                 return Row.getComponentPtr(try Table.resolveRef(self), T);
             }
 
             /// Overwrites the component payload of the entity row.
             /// The value type selects the column, no separate type tag.
+            /// Flag values only set the activity bit.
             pub fn setComponent(self: EntityReference, component: anytype) Error!void {
                 return Row.setComponent(try Table.resolveRef(self), component);
             }
@@ -174,8 +184,16 @@ pub fn ECSTable(comptime table_id: u32) type {
 
             /// Copies the component payload out of a live row.
             /// Returned bytes are meaningful only while the row is active.
+            /// Flag components carry no payload and return `T{}`; use
+            /// `isComponentActive` or `Query` to distinguish enabled rows.
             pub fn getComponent(row: u32, comptime T: type) Error!T {
-                if (comptime !hasFields(T)) @compileError("flag components carry no payload");
+                if (comptime !hasFields(T)) {
+                    if (!initialized) return Error.NotInitialized;
+                    if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
+                    if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
+                    _ = try Table.flagColumn(T);
+                    return T{};
+                }
                 if (!initialized) return Error.NotInitialized;
                 if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
                 if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
@@ -187,8 +205,17 @@ pub fn ECSTable(comptime table_id: u32) type {
 
             /// Returns a mutable pointer into a live row payload.
             /// The row address satisfies `@alignOf(T)` by column layout.
+            /// Flag components share one `dummy` byte per column: every row
+            /// of one flag returns the same address, writes are no-ops.
+            /// Never compare these pointers for row identity.
             pub fn getComponentPtr(row: u32, comptime T: type) Error!*T {
-                if (comptime !hasFields(T)) @compileError("flag components carry no payload");
+                if (comptime !hasFields(T)) {
+                    if (!initialized) return Error.NotInitialized;
+                    if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
+                    if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
+                    const col = try Table.flagColumn(T);
+                    return @ptrCast(@alignCast(&col.dummy));
+                }
                 if (!initialized) return Error.NotInitialized;
                 if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
                 if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
@@ -198,9 +225,17 @@ pub fn ECSTable(comptime table_id: u32) type {
 
             /// Overwrites the component payload of a live row.
             /// The value type selects the column, no separate type tag.
+            /// Flag values (e.g. `Tag{}`) only set the activity bit.
             pub fn setComponent(row: u32, component: anytype) Error!void {
                 const T = @TypeOf(component);
-                if (comptime !hasFields(T)) @compileError("flag components carry no payload");
+                if (comptime !hasFields(T)) {
+                    if (!initialized) return Error.NotInitialized;
+                    if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
+                    if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
+                    const tree = try Table.componentTree(T);
+                    tree.setBit(row, .active);
+                    return;
+                }
                 if (!initialized) return Error.NotInitialized;
                 if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
                 if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
@@ -236,9 +271,15 @@ pub fn ECSTable(comptime table_id: u32) type {
                 const col = try dataColumn(T);
                 return &col.tree;
             } else {
-                const idx = flag_map.get(@typeName(T)) orelse return Error.ComponentNotFound;
-                return &flag_cols.items[idx].tree;
+                const col = try flagColumn(T);
+                return &col.tree;
             }
+        }
+
+        /// Resolves a flag column by component type.
+        fn flagColumn(comptime T: type) Error!*FlagColumn {
+            const idx = flag_map.get(@typeName(T)) orelse return Error.ComponentNotFound;
+            return &flag_cols.items[idx];
         }
 
         /// Resolves a payload column by component type.
@@ -299,6 +340,127 @@ pub fn ECSTable(comptime table_id: u32) type {
             const ti = @typeInfo(T);
             if (ti != .@"struct") @compileError("component must be a struct type");
             return ti.@"struct".fields.len > 0;
+        }
+
+        /// True for tuple values/types (structs with `is_tuple`), including
+        /// empty `. {}`. Never errors: non-structs return false.
+        /// Checked before `hasFields` so empty groups are not mistaken
+        /// for flag components.
+        fn isTuple(comptime T: type) bool {
+            const ti = @typeInfo(T);
+            return ti == .@"struct" and ti.@"struct".is_tuple;
+        }
+
+        /// Number of leaf component types in a (possibly nested) query
+        /// tuple, depth-first, empty groups contribute zero. Duplicates
+        /// count repeatedly here; see `countUniqueQueryLeaves`.
+        pub fn countQueryLeaves(comptime nested: anytype) usize {
+            comptime var n: usize = 0;
+            inline for (nested) |e| {
+                if (comptime @TypeOf(e) == type) {
+                    n += 1;
+                } else if (comptime isTuple(@TypeOf(e))) {
+                    n += comptime countQueryLeaves(e);
+                } else {
+                    @compileError("query tuples hold component types or nested tuples of types");
+                }
+            }
+            return n;
+        }
+
+        /// idx-th leaf type of a nested query tuple, depth-first. This is
+        /// the flat view: no intermediate tuple is ever materialized.
+        pub fn queryLeafAt(comptime nested: anytype, comptime idx: usize) type {
+            comptime var cur: usize = 0;
+            inline for (nested) |e| {
+                if (comptime @TypeOf(e) == type) {
+                    if (cur == idx) return e;
+                    cur += 1;
+                } else if (comptime isTuple(@TypeOf(e))) {
+                    const m = comptime countQueryLeaves(e);
+                    if (idx < cur + m) return comptime queryLeafAt(e, idx - cur);
+                    cur += m;
+                } else {
+                    @compileError("query tuples hold component types or nested tuples of types");
+                }
+            }
+            @compileError("leaf index out of bounds");
+        }
+
+        /// True if leaf `idx` has no equal leaf before it: dedup keeps the
+        /// first occurrence, later ones are skipped on fill.
+        pub fn isFirstQueryOccurrence(comptime nested: anytype, comptime idx: usize) bool {
+            const C = comptime queryLeafAt(nested, idx);
+            inline for (0..idx) |j| {
+                if (comptime queryLeafAt(nested, j) == C) return false;
+            }
+            return true;
+        }
+
+        /// Deduped leaf count: sizes the exact `[*Tree]` arrays in
+        /// `iterateAll` after silent first-occurrence dedup.
+        pub fn countUniqueQueryLeaves(comptime nested: anytype) usize {
+            const n = comptime countQueryLeaves(nested);
+            comptime var m: usize = 0;
+            inline for (0..n) |i| {
+                if (comptime isFirstQueryOccurrence(nested, i)) m += 1;
+            }
+            return m;
+        }
+
+        /// True if a nested query tuple contains type `C` at any depth.
+        pub fn queryContains(comptime nested: anytype, comptime C: type) bool {
+            const n = comptime countQueryLeaves(nested);
+            inline for (0..n) |i| {
+                if (comptime queryLeafAt(nested, i) == C) return true;
+            }
+            return false;
+        }
+
+        /// Leaf shape check over nested groups: every leaf must pass
+        /// `checkQueryType`; groups recurse, anything else is an error.
+        fn checkQueryNested(comptime nested: anytype) void {
+            inline for (nested) |e| {
+                if (comptime @TypeOf(e) == type) {
+                    checkQueryType(e);
+                } else if (comptime isTuple(@TypeOf(e))) {
+                    checkQueryNested(e);
+                } else {
+                    @compileError("query tuples hold component types or nested tuples of types");
+                }
+            }
+        }
+
+        /// Number of leaf values in a (possibly nested) create tuple type,
+        /// depth-first, empty groups contribute zero.
+        pub fn countValueLeaves(comptime TupleType: type) usize {
+            comptime var n: usize = 0;
+            inline for (@typeInfo(TupleType).@"struct".fields) |f| {
+                if (comptime isTuple(f.type)) {
+                    n += comptime countValueLeaves(f.type);
+                } else {
+                    n += 1;
+                }
+            }
+            return n;
+        }
+
+        /// idx-th leaf TYPE of a nested value-tuple type, depth-first.
+        /// Types only, values stay in place: validation never copies
+        /// payloads, the runtime walk reads leaves from nested slots.
+        pub fn valueLeafTypeAt(comptime TupleType: type, comptime idx: usize) type {
+            comptime var cur: usize = 0;
+            inline for (@typeInfo(TupleType).@"struct".fields) |f| {
+                if (comptime isTuple(f.type)) {
+                    const m = comptime countValueLeaves(f.type);
+                    if (idx < cur + m) return comptime valueLeafTypeAt(f.type, idx - cur);
+                    cur += m;
+                } else {
+                    if (cur == idx) return f.type;
+                    cur += 1;
+                }
+            }
+            @compileError("leaf index out of bounds");
         }
 
         /// Registers a component type. Creates one column sized to the
@@ -424,19 +586,27 @@ pub fn ECSTable(comptime table_id: u32) type {
         }
 
         /// Creates one entity from a tuple of component values.
-        /// An empty tuple creates a bare entity. Duplicate types and flag
-        /// components in the tuple are comptime errors. Every listed type
-        /// must be registered; listed columns start active with copied
-        /// payloads, every other column starts inactive on the new row.
-        /// `values` must be a tuple even for a single component:
-        /// `create(alloc, .{ Transform{ .scale = ... } })`.
+        /// An empty tuple creates a bare entity. Tuples may nest: groups
+        /// like `const g = .{ Transform{...}, Tag{} };` expand depth-first,
+        /// e.g. `create(alloc, .{ g, Health{...} })`; empty groups vanish.
+        /// Duplicate data types are comptime errors (ambiguous payload);
+        /// duplicate flags dedup silently. Every listed type must be
+        /// registered; listed data columns start active with copied
+        /// payloads, listed flag columns start active with no payload,
+        /// every other column starts inactive on the new row.
+        /// `values` may be a tuple or a single component value:
+        /// `create(alloc, .{ Transform{ .scale = ... } })` or
+        /// `create(alloc, Transform{ .scale = ... })`, likewise
+        /// `create(alloc, .{ Tag{} })` or `create(alloc, Tag{})`.
         pub fn create(alloc: Allocator, values: anytype) Error!EntityReference {
             const V = @TypeOf(values);
             const ti = @typeInfo(V);
-            if (ti != .@"struct" or !ti.@"struct".is_tuple) {
-                @compileError("ECSTable.create(alloc, values): `values` must be a tuple of component values, e.g. `.{ Transform{ .scale = ... } }`; got `" ++ @typeName(V) ++ "`. Hint: wrap even a single component value in `.{ ... }`.");
-            } else {
+            if (ti == .@"struct" and ti.@"struct".is_tuple) {
                 return createChecked(alloc, values);
+            } else if (ti == .@"struct") {
+                return createChecked(alloc, .{values});
+            } else {
+                @compileError("ECSTable.create(alloc, values): `values` must be a tuple of component values or a single component value, e.g. `.{ Transform{ .scale = ... } }` or `Transform{ .scale = ... }`; got `" ++ @typeName(V) ++ "`.");
             }
         }
 
@@ -446,17 +616,11 @@ pub fn ECSTable(comptime table_id: u32) type {
         fn createChecked(alloc: Allocator, values: anytype) Error!EntityReference {
             if (!initialized) return Error.NotInitialized;
             validateTuple(values);
-            inline for (values) |v| {
-                if (!containComponent(@TypeOf(v))) return Error.ComponentNotFound;
-            }
+            try ensureRegistered(values);
             const row = try allocRow(alloc);
             for (data_cols.items) |*col| col.tree.setBit(row, .inactive);
             for (flag_cols.items) |*col| col.tree.setBit(row, .inactive);
-            inline for (values) |v| {
-                const col = try dataColumn(@TypeOf(v));
-                col.tree.setBit(row, .active);
-                @memcpy(rowBytes(col, row), std.mem.asBytes(&v));
-            }
+            try activateRowValues(row, values);
             const slot: u32 = @intCast(indirection.items.len);
             try indirection.append(alloc, row);
             try generations.append(alloc, 0);
@@ -472,12 +636,13 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// Creates `n` entities from the same tuple, invoking `cb` with
         /// each fresh handle. Handles stream through the comptime callback
         /// one by one, no handle array is ever allocated.
-        /// `values` must be a tuple even for a single component.
+        /// `values` may be a tuple or a single component value; nested
+        /// groups are supported exactly like in `create`.
         pub fn createN(alloc: Allocator, values: anytype, n: u32, context: anytype, comptime cb: fn (@TypeOf(context), EntityReference) void) Error!void {
             const V = @TypeOf(values);
             const ti = @typeInfo(V);
-            if (ti != .@"struct" or !ti.@"struct".is_tuple) {
-                @compileError("ECSTable.createN(alloc, values, n, ...): `values` must be a tuple of component values, e.g. `.{ Transform{ .scale = ... } }`; got `" ++ @typeName(V) ++ "`. Hint: wrap even a single component value in `.{ ... }`.");
+            if (ti != .@"struct") {
+                @compileError("ECSTable.createN(alloc, values, n, ...): `values` must be a tuple of component values or a single component value, e.g. `.{ Transform{ .scale = ... } }` or `Transform{ .scale = ... }`; got `" ++ @typeName(V) ++ "`.");
             } else {
                 if (!initialized) return Error.NotInitialized;
                 var i: u32 = 0;
@@ -552,6 +717,14 @@ pub fn ECSTable(comptime table_id: u32) type {
         /// rows with every `Includes` component enabled minus rows with any
         /// `Excludes` component enabled.
         ///
+        /// `Includes`/`Excludes` accept nested groups: tuples may contain
+        /// component types or other tuples, e.g. `const g = .{ A, B };` then
+        /// `Query(.{ g, C }, ...)`. A single component type may pass bare,
+        /// without a tuple: `Query(A, .{})` means the same as `Query(.{A}, .{})`.
+        /// Groups expand depth-first into one flat list, empty groups vanish,
+        /// duplicate types dedup silently.
+        /// A type listed on both sides is a comptime error.
+        ///
         /// Idioms, no second callback needed:
         /// - entities with A and B but not C: Includes={A,B}, Excludes={C}.
         /// - every entity except ones having C: Includes={}, Excludes={C}.
@@ -575,8 +748,15 @@ pub fn ECSTable(comptime table_id: u32) type {
             comptime on_row: fn (ctx: Context, row: u32) callconv(.@"inline") anyerror!bool,
         ) type {
             comptime validateQuery(Includes, Excludes);
-            const IL = Includes.len;
-            const EL = Excludes.len;
+            const NormI = if (comptime isTuple(@TypeOf(Includes))) Includes else .{Includes};
+            const NormE = if (comptime isTuple(@TypeOf(Excludes))) Excludes else .{Excludes};
+            comptime checkQueryNested(NormI);
+            comptime checkQueryNested(NormE);
+            comptime validateQueryCross(NormI, NormE);
+            const IL = countUniqueQueryLeaves(NormI);
+            const EL = countUniqueQueryLeaves(NormE);
+            const NI = countQueryLeaves(NormI);
+            const NE = countQueryLeaves(NormE);
             return struct {
                 /// Runs the match over an optional bit range with an optional
                 /// entity activity filter. Returns false on early callback
@@ -585,9 +765,27 @@ pub fn ECSTable(comptime table_id: u32) type {
                 pub fn iterateAll(ctx: Context, start_bit: ?u32, end_bit: ?u32, entity_activity: ?bool) anyerror!bool {
                     if (!initialized) return Error.NotInitialized;
                     var inc: [IL]*Tree = undefined;
-                    inline for (Includes, 0..) |C, k| inc[k] = try Table.componentTree(C);
+                    {
+                        var cursor: usize = 0;
+                        inline for (0..NI) |i| {
+                            if (comptime isFirstQueryOccurrence(NormI, i)) {
+                                inc[cursor] = try Table.componentTree(queryLeafAt(NormI, i));
+                                cursor += 1;
+                            }
+                        }
+                        std.debug.assert(cursor == IL);
+                    }
                     var exc: [EL + 1]*Tree = undefined;
-                    inline for (Excludes, 0..) |C, k| exc[k] = try Table.componentTree(C);
+                    {
+                        var cursor: usize = 0;
+                        inline for (0..NE) |i| {
+                            if (comptime isFirstQueryOccurrence(NormE, i)) {
+                                exc[cursor] = try Table.componentTree(queryLeafAt(NormE, i));
+                                cursor += 1;
+                            }
+                        }
+                        std.debug.assert(cursor == EL);
+                    }
                     exc[EL] = &destroyed;
                     if (entity_activity) |ea| {
                         if (ea) {
@@ -611,28 +809,33 @@ pub fn ECSTable(comptime table_id: u32) type {
             };
         }
 
-        /// Comptime shape check of a query: both sides are tuples of struct
-        /// types with no duplicates inside or across the tuple pair.
+        /// Comptime shape check of a query: each side is a tuple, a single
+        /// component type, or a nested group. Leaf shape is checked by
+        /// `checkQueryNested`, cross-side conflicts by `validateQueryCross`.
         fn validateQuery(Includes: anytype, Excludes: anytype) void {
-            const IT = @TypeOf(Includes);
-            const iti = @typeInfo(IT);
-            const ET = @TypeOf(Excludes);
-            const eti = @typeInfo(ET);
-            if (iti != .@"struct" or !iti.@"struct".is_tuple) {
-                @compileError("ECSTable.Query(Includes, Excludes, ...): `Includes` must be a tuple of component types, e.g. `.{ Transform }` (empty `.{}` selects all rows); got `" ++ @typeName(IT) ++ "`." ++ if (IT == type) " Hint: pass the type wrapped in a tuple: `.{ Transform }`, not bare `Transform`." else "");
-            } else if (eti != .@"struct" or !eti.@"struct".is_tuple) {
-                @compileError("ECSTable.Query(Includes, Excludes, ...): `Excludes` must be a tuple of component types, e.g. `.{ Health }` (empty `.{}` excludes nothing); got `" ++ @typeName(ET) ++ "`." ++ if (ET == type) " Hint: pass the type wrapped in a tuple: `.{ Health}`, not bare `Health`." else "");
-            }
+            validateQuerySide(Includes, "Includes");
+            validateQuerySide(Excludes, "Excludes");
+        }
 
-            inline for (0..iti.@"struct".fields.len) |k| checkQueryType(Includes[k]);
-            inline for (0..eti.@"struct".fields.len) |k| checkQueryType(Excludes[k]);
-            inline for (0..iti.@"struct".fields.len) |i| {
-                inline for (0..i) |j| {
-                    if (Includes[j] == Includes[i]) @compileError("duplicate component type in Includes");
-                }
-                inline for (0..eti.@"struct".fields.len) |j| {
-                    if (Excludes[j] == Includes[i]) @compileError("component type in both Includes and Excludes");
-                }
+        /// One side of a query: tuple/group passes through, a bare type is
+        /// wrapped into a 1-tuple downstream; anything else (e.g. a component
+        /// value or a number) is a comptime error.
+        fn validateQuerySide(S: anytype, comptime side: []const u8) void {
+            const T = @TypeOf(S);
+            if (comptime isTuple(T)) return;
+            if (comptime T == type) return;
+            if (comptime @typeInfo(T) == .@"struct") @compileError("ECSTable.Query(...): `" ++ side ++ "` takes component TYPES, not values; pass `" ++ @typeName(T) ++ "` instead of `" ++ @typeName(T) ++ "{ ... }`.");
+            @compileError("ECSTable.Query(...): `" ++ side ++ "` must be a tuple of component types, a single component type, or a nested group; got `" ++ @typeName(T) ++ "`.");
+        }
+
+        /// Cross-side check over nested groups: any leaf type present on
+        /// both sides is a comptime error. Duplicates inside each side are
+        /// deduped silently on fill instead.
+        fn validateQueryCross(Inc: anytype, Exc: anytype) void {
+            const ni = comptime countQueryLeaves(Inc);
+            inline for (0..ni) |i| {
+                const C = comptime queryLeafAt(Inc, i);
+                if (comptime queryContains(Exc, C)) @compileError("component type in both Includes and Excludes");
             }
         }
 
@@ -674,16 +877,60 @@ pub fn ECSTable(comptime table_id: u32) type {
         }
 
         /// Comptime shape check of a create tuple: tuple-ness, struct
-        /// payload values only, no duplicate types.
+        /// values only (payload or flag), nested groups expanded via the
+        /// `countValueLeaves`/`valueLeafTypeAt` flat view. Duplicate data
+        /// types are comptime errors; duplicate flags are allowed
+        /// (idempotent setBit).
         fn validateTuple(values: anytype) void {
             const ti = @typeInfo(@TypeOf(values));
             if (ti != .@"struct" or !ti.@"struct".is_tuple) @compileError("create expects a tuple of component values");
-            inline for (ti.@"struct".fields, 0..) |f, k| {
-                const fti = @typeInfo(f.type);
-                if (fti != .@"struct") @compileError("tuple element must be a component struct value");
-                if (fti.@"struct".fields.len == 0) @compileError("flag components carry no payload, omit them from create");
-                inline for (ti.@"struct".fields[0..k]) |g| {
-                    if (g.type == f.type) @compileError("duplicate component type in create tuple");
+            validateTupleLeaves(@TypeOf(values));
+        }
+
+        /// Leaf validation on a genuine comptime tuple type: with `TT` as a
+        /// `comptime` param every derived count stays comptime-known, which
+        /// a runtime `values: anytype` param cannot guarantee.
+        fn validateTupleLeaves(comptime TT: type) void {
+            const N = comptime countValueLeaves(TT);
+            inline for (0..N) |k| {
+                const F = comptime valueLeafTypeAt(TT, k);
+                if (@typeInfo(F) != .@"struct") @compileError("tuple element must be a component struct value");
+                if (comptime isTuple(F)) @compileError("tuple element must be a component struct value");
+                inline for (0..k) |j| {
+                    if (comptime valueLeafTypeAt(TT, j) == F) {
+                        if (comptime hasFields(F)) @compileError("duplicate component type in create tuple");
+                    }
+                }
+            }
+        }
+
+        /// Registration check over nested groups: `isTuple` first so empty
+        /// groups vanish instead of hitting the flag path. Leaves keep the
+        /// same `ComponentNotFound` contract as flat tuples.
+        fn ensureRegistered(values: anytype) Error!void {
+            inline for (values) |v| {
+                if (comptime isTuple(@TypeOf(v))) {
+                    try ensureRegistered(v);
+                } else {
+                    if (!containComponent(@TypeOf(v))) return Error.ComponentNotFound;
+                }
+            }
+        }
+
+        /// Payload copy over nested groups without materializing a flat
+        /// tuple: leaves are copied straight from their nested slots into
+        /// the column, one `memcpy` per data leaf, `setBit` per flag leaf.
+        fn activateRowValues(row: u32, values: anytype) Error!void {
+            inline for (values) |v| {
+                if (comptime isTuple(@TypeOf(v))) {
+                    try activateRowValues(row, v);
+                } else if (comptime hasFields(@TypeOf(v))) {
+                    const col = try dataColumn(@TypeOf(v));
+                    col.tree.setBit(row, .active);
+                    @memcpy(rowBytes(col, row), std.mem.asBytes(&v));
+                } else {
+                    const tree = try componentTree(@TypeOf(v));
+                    tree.setBit(row, .active);
                 }
             }
         }
@@ -1162,4 +1409,299 @@ test "ECSTable Query fallible: try inside on_row aborts with that error" {
     var ok = FallibleCollect{};
     try t.expect(try Q.iterateAll(&ok, null, null, null));
     try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ok.rows[0..ok.n]);
+}
+
+test "ECSTable flags: create/set/get/ptr treat flag and data uniformly" {
+    const T = ECSTable(207);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Tag);
+
+    // create with mixed data + flag instance: flag only sets the bit.
+    const e = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 2 }, Tag{} });
+    try t.expect(try e.isComponentActive(Pos));
+    try t.expect(try e.isComponentActive(Tag));
+    try t.expectEqual(Pos{ .x = 1, .y = 2 }, try e.getComponent(Pos));
+    _ = try e.getComponent(Tag);
+
+    // create with only a flag.
+    const f = try T.create(t.allocator, .{Tag{}});
+    try t.expect(try f.isComponentActive(Tag));
+    try t.expect(!try f.isComponentActive(Pos));
+    _ = try T.Row.getComponent(1, Tag);
+
+    // setComponent with a flag only sets the bit.
+    const g = try T.create(t.allocator, .{});
+    try t.expect(!try g.isComponentActive(Tag));
+    try g.setComponent(Tag{});
+    try t.expect(try g.isComponentActive(Tag));
+    _ = try g.getComponent(Tag);
+    try T.Row.setComponent(2, Tag{});
+    try t.expect(try T.Row.isComponentActive(2, Tag));
+
+    // getComponentPtr on flags shares one address per column, writes are no-ops.
+    const p0 = try e.getComponentPtr(Tag);
+    const p1 = try f.getComponentPtr(Tag);
+    try t.expect(p0 == p1);
+    p0.* = .{};
+    try t.expect(try e.isComponentActive(Tag));
+    const q = try T.Row.getComponentPtr(0, Tag);
+    try t.expect(q == p0);
+
+    // Unregistered flag still reports ComponentNotFound everywhere.
+    const Unreg = struct {};
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{Unreg{}}));
+    try t.expectError(T.Error.ComponentNotFound, e.getComponent(Unreg));
+    try t.expectError(T.Error.ComponentNotFound, e.getComponentPtr(Unreg));
+    try t.expectError(T.Error.ComponentNotFound, e.isComponentActive(Unreg));
+}
+
+test "nested query helpers: flat view and dedup over 3+ levels" {
+    const T = ECSTable(301);
+
+    const g1 = .{ Pos, Vel };
+    const g2 = .{ g1, Health, .{} };
+    const g3 = .{ g2, Tag };
+    // Flat view of g3, depth-first: Pos, Vel, Health, Tag.
+    try t.expectEqual(@as(usize, 4), T.countQueryLeaves(g3));
+    try t.expect(T.queryLeafAt(g3, 0) == Pos);
+    try t.expect(T.queryLeafAt(g3, 1) == Vel);
+    try t.expect(T.queryLeafAt(g3, 2) == Health);
+    try t.expect(T.queryLeafAt(g3, 3) == Tag);
+
+    // Empty groups vanish at any level.
+    try t.expectEqual(@as(usize, 0), T.countQueryLeaves(.{ .{}, .{} }));
+    try t.expectEqual(@as(usize, 2), T.countQueryLeaves(.{ g1, .{} }));
+    try t.expectEqual(@as(usize, 0), T.countUniqueQueryLeaves(.{ .{}, .{} }));
+
+    // Four levels of nesting.
+    const g4 = .{ .{ .{ .{Pos} } }, Vel };
+    try t.expectEqual(@as(usize, 2), T.countQueryLeaves(g4));
+    try t.expect(T.queryLeafAt(g4, 0) == Pos);
+    try t.expect(T.queryLeafAt(g4, 1) == Vel);
+
+    // Dedup keeps the first occurrence: Pos,Pos,Vel,Tag,Vel -> Pos,Vel,Tag.
+    const d = .{ Pos, g1, Tag, Vel };
+    try t.expectEqual(@as(usize, 5), T.countQueryLeaves(d));
+    try t.expectEqual(@as(usize, 3), T.countUniqueQueryLeaves(d));
+    try t.expect(T.isFirstQueryOccurrence(d, 0));
+    try t.expect(!T.isFirstQueryOccurrence(d, 1));
+    try t.expect(T.isFirstQueryOccurrence(d, 2));
+    try t.expect(T.isFirstQueryOccurrence(d, 3));
+    try t.expect(!T.isFirstQueryOccurrence(d, 4));
+
+    // Dedup through nesting: .{g1, Pos, .{Vel}} -> Pos, Vel.
+    const dn = .{ g1, Pos, .{Vel} };
+    try t.expectEqual(@as(usize, 2), T.countUniqueQueryLeaves(dn));
+
+    // Containment sees through groups.
+    try t.expect(T.queryContains(g3, Vel));
+    try t.expect(T.queryContains(g3, Tag));
+    try t.expect(!T.queryContains(g3, Ghost));
+    try t.expect(!T.queryContains(.{ .{}, .{ g1, .{} } }, Ghost));
+    try t.expect(T.queryContains(.{ .{ .{Ghost} } }, Ghost));
+}
+
+test "nested value helpers: flat leaf types over 3+ levels" {
+    const T = ECSTable(302);
+
+    const VT = @TypeOf(.{
+        Pos{ .x = 1, .y = 2 },
+        .{ Vel{ .dx = 3, .dy = 4 }, Tag{} },
+        .{.{ Health{ .hp = 5 } }},
+        .{},
+    });
+    // Depth-first: Pos, Vel, Tag, Health.
+    try t.expectEqual(@as(usize, 4), T.countValueLeaves(VT));
+    try t.expect(T.valueLeafTypeAt(VT, 0) == Pos);
+    try t.expect(T.valueLeafTypeAt(VT, 1) == Vel);
+    try t.expect(T.valueLeafTypeAt(VT, 2) == Tag);
+    try t.expect(T.valueLeafTypeAt(VT, 3) == Health);
+
+    // Empty groups contribute zero leaves at any depth.
+    try t.expectEqual(@as(usize, 0), T.countValueLeaves(@TypeOf(.{ .{}, .{.{}} })));
+    try t.expectEqual(@as(usize, 1), T.countValueLeaves(@TypeOf(.{ .{}, Tag{} })));
+
+    // Four levels, single leaf.
+    const Deep = @TypeOf(.{ .{ .{ .{Pos{ .x = 0, .y = 0 }} } } });
+    try t.expectEqual(@as(usize, 1), T.countValueLeaves(Deep));
+    try t.expect(T.valueLeafTypeAt(Deep, 0) == Pos);
+}
+
+test "ECSTable nested create: groups expand depth-first with payloads" {
+    const T = ECSTable(303);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.addComponent(t.allocator, Health);
+    _ = try T.addComponent(t.allocator, Tag);
+
+    // Reusable group mixing data and flag instances, plus empty groups.
+    const base = .{ Pos{ .x = 1, .y = 2 }, Tag{} };
+    const mid = .{ base, Vel{ .dx = 3, .dy = 4 }, .{} };
+    const e = try T.create(t.allocator, .{ mid, Health{ .hp = 9 }, .{.{}} });
+    try t.expect(try e.isComponentActive(Pos));
+    try t.expect(try e.isComponentActive(Vel));
+    try t.expect(try e.isComponentActive(Health));
+    try t.expect(try e.isComponentActive(Tag));
+    try t.expectEqual(Pos{ .x = 1, .y = 2 }, try e.getComponent(Pos));
+    try t.expectEqual(Vel{ .dx = 3, .dy = 4 }, try e.getComponent(Vel));
+    try t.expectEqual(Health{ .hp = 9 }, try e.getComponent(Health));
+
+    // Runtime values inside groups land in the column verbatim.
+    const got = try e.getComponent(Pos);
+    const rg = .{got};
+    const f = try T.create(t.allocator, .{ .{rg}, Tag{} });
+    try t.expectEqual(Pos{ .x = 1, .y = 2 }, try f.getComponent(Pos));
+    try t.expect(try f.isComponentActive(Tag));
+    try t.expect(!try f.isComponentActive(Vel));
+
+    // Duplicate flags across groups dedup silently (idempotent setBit).
+    const g = try T.create(t.allocator, .{ Tag{}, .{Tag{}, .{}} });
+    try t.expect(try g.isComponentActive(Tag));
+
+    // createN reuses the same nested group per entity.
+    const Ctx = struct {
+        count: u32 = 0,
+        last: T.EntityReference = .{ .slot = 0, .gen = 0 },
+
+        fn push(self: *@This(), ref: T.EntityReference) void {
+            self.count += 1;
+            self.last = ref;
+        }
+    };
+    var ctx = Ctx{};
+    try T.createN(t.allocator, .{mid}, 3, &ctx, Ctx.push);
+    try t.expectEqual(@as(u32, 3), ctx.count);
+    try t.expect(ctx.last.isValid());
+    try t.expectEqual(Pos{ .x = 1, .y = 2 }, try ctx.last.getComponent(Pos));
+    try t.expect(try ctx.last.isComponentActive(Tag));
+
+    // Missing registration is still reported through nesting.
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{ .{Ghost{ .v = 1 }} }));
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{ Pos{ .x = 0, .y = 0 }, .{ .{Ghost{ .v = 2 }} } }));
+}
+
+test "ECSTable nested Query: groups, dedup, excludes at depth" {
+    const T = ECSTable(304);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.addComponent(t.allocator, Tag);
+    _ = try T.addComponent(t.allocator, Health);
+
+    // Rows: 0:Pos 1:Pos+Vel 2:Pos+Vel+Tag 3:Vel+Tag 4:Pos+Tag+Health.
+    _ = try T.create(t.allocator, .{Pos{ .x = 0, .y = 0 }});
+    _ = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 1 }, Vel{ .dx = 1, .dy = 1 } });
+    _ = try T.create(t.allocator, .{ Pos{ .x = 2, .y = 2 }, .{ Vel{ .dx = 2, .dy = 2 }, Tag{} } });
+    _ = try T.create(t.allocator, .{ Vel{ .dx = 3, .dy = 3 }, Tag{} });
+    _ = try T.create(t.allocator, .{ .{ Pos{ .x = 4, .y = 4 }, Tag{} }, Health{ .hp = 4 } });
+
+    const g = .{ Pos, Vel };
+
+    // Group in Includes behaves like the flat list.
+    const Q1 = T.Query(.{ g, Tag }, .{}, .forward, *Collect, Collect.push);
+    var c = Collect{};
+    try t.expect(try Q1.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{2}, c.rows[0..c.n]);
+
+    // Duplicates across nesting levels dedup to the same match.
+    const Q2 = T.Query(.{ Pos, .{ Pos, Vel }, Tag, .{ Vel, Tag } }, .{}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q2.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{2}, c.rows[0..c.n]);
+
+    // Nested group in Excludes.
+    const Q3 = T.Query(.{Pos}, .{ .{Vel} }, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q3.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 4 }, c.rows[0..c.n]);
+
+    // Deep nesting plus empty groups on both sides.
+    const Q4 = T.Query(.{ .{ .{Pos} }, .{} }, .{ .{ .{Health} } }, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q4.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, c.rows[0..c.n]);
+
+    // Nested group passed whole, without an outer wrapper element.
+    const Q5 = T.Query(g, .{ .{Health} }, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q5.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 1, 2 }, c.rows[0..c.n]);
+}
+
+test "bare single struct without tuple: create/createN/Query" {
+    const T = ECSTable(305);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.addComponent(t.allocator, Tag);
+
+    // Bare data instance behaves like a 1-tuple.
+    const a = try T.create(t.allocator, Pos{ .x = 1, .y = 2 });
+    try t.expect(try a.isComponentActive(Pos));
+    try t.expect(!try a.isComponentActive(Vel));
+    try t.expectEqual(Pos{ .x = 1, .y = 2 }, try a.getComponent(Pos));
+
+    // Bare flag instance only sets the bit.
+    const b = try T.create(t.allocator, Tag{});
+    try t.expect(try b.isComponentActive(Tag));
+    try t.expect(!try b.isComponentActive(Pos));
+
+    // Bare unregistered component still reports ComponentNotFound.
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, Ghost{ .v = 1 }));
+
+    // Bare value in createN.
+    const Ctx = struct {
+        count: u32 = 0,
+        last: T.EntityReference = .{ .slot = 0, .gen = 0 },
+
+        fn push(self: *@This(), ref: T.EntityReference) void {
+            self.count += 1;
+            self.last = ref;
+        }
+    };
+    var ctx = Ctx{};
+    try T.createN(t.allocator, Vel{ .dx = 5, .dy = 6 }, 2, &ctx, Ctx.push);
+    try t.expectEqual(@as(u32, 2), ctx.count);
+    try t.expectEqual(Vel{ .dx = 5, .dy = 6 }, try ctx.last.getComponent(Vel));
+
+    // Rows so far: 0:Pos 1:Tag 2:Vel 3:Vel.
+    // Bare Includes behaves like .{Pos}.
+    const Q1 = T.Query(Pos, .{}, .forward, *Collect, Collect.push);
+    var c = Collect{};
+    try t.expect(try Q1.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{0}, c.rows[0..c.n]);
+
+    // Bare Excludes behaves like .{Vel}.
+    const Q2 = T.Query(.{}, Vel, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q2.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 1 }, c.rows[0..c.n]);
+
+    // Bare on both sides.
+    const Q3 = T.Query(Pos, Vel, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q3.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{0}, c.rows[0..c.n]);
+
+    // Bare mixed with a group.
+    const Q4 = T.Query(.{ Tag, Pos }, Vel, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q4.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{}, c.rows[0..c.n]);
+
+    // Bare flag query matches flag rows.
+    const Q5 = T.Query(Tag, .{}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q5.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{1}, c.rows[0..c.n]);
 }
