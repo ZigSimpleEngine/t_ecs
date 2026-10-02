@@ -7,7 +7,7 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const T = t_ecs.ECSTable(0);
+    const T = t_ecs.ECSTable(.default);
     try T.init();
     defer T.deinit(alloc);
 

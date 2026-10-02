@@ -5,9 +5,11 @@ const Tree = bit_tree.BitTree(.u64);
 const BitState = bit_tree.BitState;
 const Allocator = std.mem.Allocator;
 
-/// Fixed-identity table id tag is the `table_id` comptime parameter itself:
-/// every `EntityReference` belongs to its `ECSTable(id)` instantiation by type.
-pub fn ECSTable(comptime table_id: u32) type {
+/// Fixed-identity table tag is the `tag` comptime parameter itself:
+/// every `EntityReference` belongs to its `ECSTable(tag)` instantiation by type.
+/// `tag` must be an enum literal (e.g. `.default`, `.main`), so different tags
+/// give fully isolated table instances for the same component set.
+pub fn ECSTable(comptime tag: @EnumLiteral()) type {
     return struct {
         const Table = @This();
 
@@ -24,7 +26,7 @@ pub fn ECSTable(comptime table_id: u32) type {
         var flag_map: std.StringHashMapUnmanaged(u32) = .empty;
 
         /// Table identity carried by the type, never stored per entity.
-        pub const table: u32 = table_id;
+        pub const tag_value = tag;
 
         /// Component column with payload. Bytes are typeless `u8` storage
         /// with an explicit cast on request; layout is base-aligned with a
@@ -1042,7 +1044,7 @@ pub fn ECSTable(comptime table_id: u32) type {
 const t = std.testing;
 
 test "ECSTable core: create/isValid/destroy lifecycle" {
-    const T = ECSTable(101);
+    const T = ECSTable(.t101);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1068,7 +1070,7 @@ test "ECSTable core: create/isValid/destroy lifecycle" {
 }
 
 test "ECSTable core: destroyed rows are reused lowest-first" {
-    const T = ECSTable(102);
+    const T = ECSTable(.t102);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1090,7 +1092,7 @@ test "ECSTable core: destroyed rows are reused lowest-first" {
 }
 
 test "ECSTable core: createN streams handles through the callback" {
-    const T = ECSTable(103);
+    const T = ECSTable(.t103);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1112,7 +1114,7 @@ test "ECSTable core: createN streams handles through the callback" {
 }
 
 test "ECSTable core: Row plane validates bounds and liveness" {
-    const T = ECSTable(104);
+    const T = ECSTable(.t104);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1134,7 +1136,7 @@ test "ECSTable core: Row plane validates bounds and liveness" {
 }
 
 test "ECSTable core: rowToEntity tracks moves of the same row" {
-    const T = ECSTable(105);
+    const T = ECSTable(.t105);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1154,7 +1156,7 @@ const Tag = struct {};
 const Ghost = struct { v: u8 };
 
 test "ECSTable columns: add/remove/contain with swap remap" {
-    const T = ECSTable(201);
+    const T = ECSTable(.t201);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1186,7 +1188,7 @@ test "ECSTable columns: add/remove/contain with swap remap" {
 }
 
 test "ECSTable columns: late add sizes rows, get/set/ptr roundtrip" {
-    const T = ECSTable(202);
+    const T = ECSTable(.t202);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1211,7 +1213,7 @@ test "ECSTable columns: late add sizes rows, get/set/ptr roundtrip" {
 }
 
 test "ECSTable create tuple: payloads, flags, missing type" {
-    const T = ECSTable(203);
+    const T = ECSTable(.t203);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1239,7 +1241,7 @@ test "ECSTable create tuple: payloads, flags, missing type" {
 }
 
 test "ECSTable clearDestroyed: swap-remove moves data and seals slots" {
-    const T = ECSTable(204);
+    const T = ECSTable(.t204);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1290,7 +1292,7 @@ const Collect = struct {
 };
 
 test "ECSTable Query: truth table, idioms, direction, range, filters" {
-    const T = ECSTable(205);
+    const T = ECSTable(.t205);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1382,7 +1384,7 @@ const FallibleCollect = struct {
 };
 
 test "ECSTable Query fallible: try inside on_row aborts with that error" {
-    const T = ECSTable(206);
+    const T = ECSTable(.t206);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1412,7 +1414,7 @@ test "ECSTable Query fallible: try inside on_row aborts with that error" {
 }
 
 test "ECSTable flags: create/set/get/ptr treat flag and data uniformly" {
-    const T = ECSTable(207);
+    const T = ECSTable(.t207);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1459,7 +1461,7 @@ test "ECSTable flags: create/set/get/ptr treat flag and data uniformly" {
 }
 
 test "nested query helpers: flat view and dedup over 3+ levels" {
-    const T = ECSTable(301);
+    const T = ECSTable(.t301);
 
     const g1 = .{ Pos, Vel };
     const g2 = .{ g1, Health, .{} };
@@ -1505,7 +1507,7 @@ test "nested query helpers: flat view and dedup over 3+ levels" {
 }
 
 test "nested value helpers: flat leaf types over 3+ levels" {
-    const T = ECSTable(302);
+    const T = ECSTable(.t302);
 
     const VT = @TypeOf(.{
         Pos{ .x = 1, .y = 2 },
@@ -1531,7 +1533,7 @@ test "nested value helpers: flat leaf types over 3+ levels" {
 }
 
 test "ECSTable nested create: groups expand depth-first with payloads" {
-    const T = ECSTable(303);
+    const T = ECSTable(.t303);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1587,7 +1589,7 @@ test "ECSTable nested create: groups expand depth-first with payloads" {
 }
 
 test "ECSTable nested Query: groups, dedup, excludes at depth" {
-    const T = ECSTable(304);
+    const T = ECSTable(.t304);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1637,7 +1639,7 @@ test "ECSTable nested Query: groups, dedup, excludes at depth" {
 }
 
 test "bare single struct without tuple: create/createN/Query" {
-    const T = ECSTable(305);
+    const T = ECSTable(.t305);
     try T.init();
     defer T.deinit(t.allocator);
 
@@ -1704,4 +1706,41 @@ test "bare single struct without tuple: create/createN/Query" {
     c = Collect{};
     try t.expect(try Q5.iterateAll(&c, null, null, null));
     try t.expectEqualSlices(u32, &[_]u32{1}, c.rows[0..c.n]);
+}
+
+test "ECSTable tag isolates instances" {
+    const A = ECSTable(.tag_a);
+    const B = ECSTable(.tag_b);
+    const A2 = ECSTable(.tag_a);
+    try A.init();
+    defer A.deinit(t.allocator);
+    try B.init();
+    defer B.deinit(t.allocator);
+    // A and A2 share storage; B is fully isolated.
+
+    try t.expect(A.tag_value == .tag_a);
+    try t.expect(B.tag_value == .tag_b);
+    try t.expect(A.EntityReference != B.EntityReference);
+
+    const ea: A.EntityReference = try A.create(t.allocator, .{});
+    try t.expectEqual(@as(u32, 1), A.rowCount());
+    try t.expectEqual(@as(u32, 0), B.rowCount());
+    try t.expectEqual(@as(u32, 1), A2.rowCount());
+
+    // Same tag sees the same row through a re-resolved handle…
+    const rea = try A2.rowToEntity(0);
+    try t.expectEqual(ea.slot, rea.slot);
+    try t.expectEqual(ea.gen, rea.gen);
+    // …while the other tag stays empty.
+    try t.expectError(B.Error.RowOutOfBounds, B.rowToEntity(0));
+
+    const eb: B.EntityReference = try B.create(t.allocator, .{});
+    try t.expectEqual(@as(u32, 1), A.rowCount());
+    try t.expectEqual(@as(u32, 1), B.rowCount());
+    try t.expect(ea.isValid());
+    try t.expect(eb.isValid());
+
+    try ea.destroy();
+    try t.expect(!ea.isValid());
+    try t.expect(eb.isValid());
 }
