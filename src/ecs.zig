@@ -147,6 +147,21 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
             pub fn setComponentActivity(self: EntityReference, comptime T: type, state: BitState) Error!void {
                 return Row.setComponentActivity(try Table.resolveRef(self), T, state);
             }
+
+            /// Reads the activity flag of a registered `@EnumLiteral()` flag.
+            pub fn isFlagActive(self: EntityReference, comptime flag: @EnumLiteral()) Error!bool {
+                return Row.isFlagActive(try Table.resolveRef(self), flag);
+            }
+
+            /// Writes the activity flag of a registered `@EnumLiteral()` flag.
+            pub fn setFlagActivity(self: EntityReference, comptime flag: @EnumLiteral(), state: BitState) Error!void {
+                return Row.setFlagActivity(try Table.resolveRef(self), flag, state);
+            }
+
+            /// Enables a registered `@EnumLiteral()` flag on the entity.
+            pub fn setFlag(self: EntityReference, comptime flag: @EnumLiteral()) Error!void {
+                return Row.setFlag(try Table.resolveRef(self), flag);
+            }
         };
 
         /// Raw row operations without indirection. Rows are unstable across
@@ -227,8 +242,17 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
 
             /// Overwrites the component payload of a live row.
             /// The value type selects the column, no separate type tag.
-            /// Flag values (e.g. `Tag{}`) only set the activity bit.
+            /// Flag values (e.g. `Tag{}`) and `@EnumLiteral()` flags
+            /// (e.g. `.my_flag`) only set the activity bit.
             pub fn setComponent(row: u32, component: anytype) Error!void {
+                if (comptime isEnumType(@TypeOf(component))) {
+                    if (!initialized) return Error.NotInitialized;
+                    if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
+                    if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
+                    const tree = try Table.enumFlagTree(component);
+                    tree.setBit(row, .active);
+                    return;
+                }
                 const T = @TypeOf(component);
                 if (comptime !hasFields(T)) {
                     if (!initialized) return Error.NotInitialized;
@@ -263,6 +287,35 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
                 if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
                 const tree = try Table.componentTree(T);
                 tree.setBit(row, state);
+            }
+
+            /// Reads the activity flag of a registered `@EnumLiteral()` flag.
+            /// Parallel API to `isComponentActive`, which stays `type`-only
+            /// to preserve ZLS hints: `isComponentActive(Tag)` vs
+            /// `isFlagActive(.my_flag)`.
+            pub fn isFlagActive(row: u32, comptime flag: @EnumLiteral()) Error!bool {
+                if (!initialized) return Error.NotInitialized;
+                if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
+                if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
+                const tree = try Table.enumFlagTree(flag);
+                return tree.bitset.getBit(row) == .active;
+            }
+
+            /// Writes the activity flag of a registered `@EnumLiteral()` flag.
+            /// Parallel API to `setComponentActivity`.
+            pub fn setFlagActivity(row: u32, comptime flag: @EnumLiteral(), state: BitState) Error!void {
+                if (!initialized) return Error.NotInitialized;
+                if (row >= destroyed.bitset.bits_count) return Error.RowOutOfBounds;
+                if (destroyed.bitset.getBit(row) == .active) return Error.AlreadyDestroyed;
+                const tree = try Table.enumFlagTree(flag);
+                tree.setBit(row, state);
+            }
+
+            /// Enables a registered `@EnumLiteral()` flag on a live row.
+            /// Sugar over `setFlagActivity(row, flag, .active)`; the
+            /// `setComponent(.flag)` value path does the same during `create`.
+            pub fn setFlag(row: u32, comptime flag: @EnumLiteral()) Error!void {
+                try setFlagActivity(row, flag, .active);
             }
         };
 
@@ -353,18 +406,57 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
             return ti == .@"struct" and ti.@"struct".is_tuple;
         }
 
-        /// Number of leaf component types in a (possibly nested) query
-        /// tuple, depth-first, empty groups contribute zero. Duplicates
-        /// count repeatedly here; see `countUniqueQueryLeaves`.
+        /// True for `@EnumLiteral()` flag values (e.g. `.my_flag`).
+        /// Takes a value (not a type): struct component values return
+        /// false, struct types return false, only enum literals return true.
+        /// Only call in comptime-known contexts (query tuples, flag params):
+        /// for runtime component values use `isEnumType(@TypeOf(v))`.
+        fn isEnumValue(v: anytype) bool {
+            return @typeInfo(@TypeOf(v)) == .enum_literal;
+        }
+
+        /// True for the `@EnumLiteral()` type itself. Takes a type, so it
+        /// is safe for runtime component values: `isEnumType(@TypeOf(v))`
+        /// needs only the (comptime) type, never the (runtime) value.
+        fn isEnumType(comptime T: type) bool {
+            return @typeInfo(T) == .enum_literal;
+        }
+
+        /// Storage key for an `@EnumLiteral()` flag.
+        /// All enum literals share one type, so identity is the tag name.
+        /// The `@EnumLiteral(."...")` prefix can never collide with
+        /// `@typeName(T)` of struct components.
+        fn enumFlagKey(comptime flag: @EnumLiteral()) []const u8 {
+            return "@EnumLiteral(." ++ @tagName(flag) ++ ")";
+        }
+
+        /// Resolves an `@EnumLiteral()` flag column by tag name.
+        fn enumFlagColumn(comptime flag: @EnumLiteral()) Error!*FlagColumn {
+            const idx = flag_map.get(enumFlagKey(flag)) orelse return Error.ComponentNotFound;
+            return &flag_cols.items[idx];
+        }
+
+        /// Resolves the activity tree of a registered `@EnumLiteral()` flag.
+        fn enumFlagTree(comptime flag: @EnumLiteral()) Error!*Tree {
+            const col = try enumFlagColumn(flag);
+            return &col.tree;
+        }
+
+        /// Number of leaf components in a (possibly nested) query tuple,
+        /// depth-first, empty groups contribute zero. Leaves may be struct
+        /// component types or `@EnumLiteral()` flags. Duplicates count
+        /// repeatedly here; see `countUniqueQueryLeaves`.
         pub fn countQueryLeaves(comptime nested: anytype) usize {
             comptime var n: usize = 0;
             inline for (nested) |e| {
                 if (comptime @TypeOf(e) == type) {
                     n += 1;
+                } else if (comptime isEnumValue(e)) {
+                    n += 1;
                 } else if (comptime isTuple(@TypeOf(e))) {
                     n += comptime countQueryLeaves(e);
                 } else {
-                    @compileError("query tuples hold component types or nested tuples of types");
+                    @compileError("query tuples hold component types, @EnumLiteral() flags, or nested tuples thereof");
                 }
             }
             return n;
@@ -372,6 +464,11 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
 
         /// idx-th leaf type of a nested query tuple, depth-first. This is
         /// the flat view: no intermediate tuple is ever materialized.
+        /// Kept for back-compat with struct-only queries; mixed
+        /// struct/enum queries resolve via `queryLeafKeyAt` /
+        /// `queryLeafTreeAt` below, which have concrete return types
+        /// (`[]const u8` / `Error!*Tree`) so ZLS hints for `T: type`
+        /// are preserved and Zig 0.16 accepts them.
         pub fn queryLeafAt(comptime nested: anytype, comptime idx: usize) type {
             comptime var cur: usize = 0;
             inline for (nested) |e| {
@@ -380,21 +477,75 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
                     cur += 1;
                 } else if (comptime isTuple(@TypeOf(e))) {
                     const m = comptime countQueryLeaves(e);
+                    // Nested groups may hold enum flags; count them for the
+                    // offset but resolve struct leaves only. Mixed callers
+                    // must use `queryLeafKeyAt` / `queryLeafTreeAt`.
                     if (idx < cur + m) return comptime queryLeafAt(e, idx - cur);
                     cur += m;
                 } else {
-                    @compileError("query tuples hold component types or nested tuples of types");
+                    @compileError("queryLeafAt supports struct component types only; use queryLeafKeyAt/queryLeafTreeAt for mixed struct/@EnumLiteral() tuples");
+                }
+            }
+            @compileError("leaf index out of bounds");
+        }
+
+        /// idx-th leaf storage key of a nested query tuple, depth-first:
+        /// `@typeName(T)` for struct component types,
+        /// `"@EnumLiteral(.name)"` for enum flags. Keys uniquely identify
+        /// leaves (all enum literals share one type, so tag name is the
+        /// identity), so string equality replaces type `==` for mixed
+        /// tuples. Concrete `[]const u8` return keeps Zig 0.16 happy.
+        pub fn queryLeafKeyAt(comptime nested: anytype, comptime idx: usize) []const u8 {
+            comptime var cur: usize = 0;
+            inline for (nested) |e| {
+                if (comptime @TypeOf(e) == type) {
+                    if (cur == idx) return @typeName(e);
+                    cur += 1;
+                } else if (comptime isEnumValue(e)) {
+                    if (cur == idx) return comptime enumFlagKey(e);
+                    cur += 1;
+                } else if (comptime isTuple(@TypeOf(e))) {
+                    const m = comptime countQueryLeaves(e);
+                    if (idx < cur + m) return comptime queryLeafKeyAt(e, idx - cur);
+                    cur += m;
+                } else {
+                    @compileError("query tuples hold component types, @EnumLiteral() flags, or nested tuples thereof");
+                }
+            }
+            @compileError("leaf index out of bounds");
+        }
+
+        /// Activity tree of the idx-th leaf of a nested query tuple.
+        /// Struct leaves resolve via `componentTree`, enum leaves via
+        /// `enumFlagTree`. Concrete `Error!*Tree` return, no `anytype`.
+        fn queryLeafTreeAt(comptime nested: anytype, comptime idx: usize) Error!*Tree {
+            comptime var cur: usize = 0;
+            inline for (nested) |e| {
+                if (comptime @TypeOf(e) == type) {
+                    if (cur == idx) return componentTree(e);
+                    cur += 1;
+                } else if (comptime isEnumValue(e)) {
+                    if (cur == idx) return enumFlagTree(e);
+                    cur += 1;
+                } else if (comptime isTuple(@TypeOf(e))) {
+                    const m = comptime countQueryLeaves(e);
+                    if (idx < cur + m) return queryLeafTreeAt(e, idx - cur);
+                    cur += m;
+                } else {
+                    @compileError("query tuples hold component types, @EnumLiteral() flags, or nested tuples thereof");
                 }
             }
             @compileError("leaf index out of bounds");
         }
 
         /// True if leaf `idx` has no equal leaf before it: dedup keeps the
-        /// first occurrence, later ones are skipped on fill.
+        /// first occurrence, later ones are skipped on fill. Comparison is
+        /// by storage key, so different enum flags (same type, different
+        /// tag names) are distinct.
         pub fn isFirstQueryOccurrence(comptime nested: anytype, comptime idx: usize) bool {
-            const C = comptime queryLeafAt(nested, idx);
+            const key = comptime queryLeafKeyAt(nested, idx);
             inline for (0..idx) |j| {
-                if (comptime queryLeafAt(nested, j) == C) return false;
+                if (comptime std.mem.eql(u8, queryLeafKeyAt(nested, j), key)) return false;
             }
             return true;
         }
@@ -411,24 +562,43 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         }
 
         /// True if a nested query tuple contains type `C` at any depth.
+        /// Mixed tuples with `@EnumLiteral()` flags are supported: enum
+        /// leaves have prefixed keys that never equal `@typeName(C)`.
         pub fn queryContains(comptime nested: anytype, comptime C: type) bool {
+            const want = @typeName(C);
             const n = comptime countQueryLeaves(nested);
             inline for (0..n) |i| {
-                if (comptime queryLeafAt(nested, i) == C) return true;
+                if (comptime std.mem.eql(u8, queryLeafKeyAt(nested, i), want)) return true;
+            }
+            return false;
+        }
+
+        /// True if a nested query tuple contains `@EnumLiteral()` flag
+        /// `flag` at any depth. Parallel API to `queryContains`, which
+        /// stays `type`-only: `queryContains(g, Pos)` vs
+        /// `queryContainsFlag(g, .my_flag)`.
+        pub fn queryContainsFlag(comptime nested: anytype, comptime flag: @EnumLiteral()) bool {
+            const want = comptime enumFlagKey(flag);
+            const n = comptime countQueryLeaves(nested);
+            inline for (0..n) |i| {
+                if (comptime std.mem.eql(u8, queryLeafKeyAt(nested, i), want)) return true;
             }
             return false;
         }
 
         /// Leaf shape check over nested groups: every leaf must pass
         /// `checkQueryType`; groups recurse, anything else is an error.
+        /// Struct types and `@EnumLiteral()` flags are both accepted.
         fn checkQueryNested(comptime nested: anytype) void {
             inline for (nested) |e| {
                 if (comptime @TypeOf(e) == type) {
                     checkQueryType(e);
+                } else if (comptime isEnumValue(e)) {
+                    checkQueryFlag(e);
                 } else if (comptime isTuple(@TypeOf(e))) {
                     checkQueryNested(e);
                 } else {
-                    @compileError("query tuples hold component types or nested tuples of types");
+                    @compileError("query tuples hold component types, @EnumLiteral() flags, or nested tuples thereof");
                 }
             }
         }
@@ -540,6 +710,57 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
             return flag_map.contains(@typeName(T));
         }
 
+        /// Registers an `@EnumLiteral()` flag. Creates one flag column
+        /// sized to the current row count, all flags inactive.
+        /// Parallel API to `addComponent`, which stays `type`-only:
+        /// `addComponent(Pos)` vs `addFlag(.my_flag)`.
+        /// Returns `true` if the flag was registered, `false` if it
+        /// was already registered (idempotent no-op).
+        pub fn addFlag(alloc: Allocator, comptime flag: @EnumLiteral()) Error!bool {
+            if (!initialized) return Error.NotInitialized;
+            const key = comptime enumFlagKey(flag);
+            if (flag_map.contains(key)) return false;
+            const rows: usize = destroyed.bitset.bits_count;
+            try flag_cols.append(alloc, FlagColumn{
+                .name = try alloc.dupe(u8, key),
+            });
+            errdefer {
+                var leaked = flag_cols.pop() orelse unreachable;
+                leaked.tree.deinit(alloc);
+                alloc.free(leaked.name);
+            }
+            const col = &flag_cols.items[flag_cols.items.len - 1];
+            try col.tree.resize(alloc, @intCast(rows), .inactive);
+            try flag_map.put(alloc, col.name, @intCast(flag_cols.items.len - 1));
+            return true;
+        }
+
+        /// Unregisters an `@EnumLiteral()` flag. Removes its column with
+        /// swap-remove and repoints the map entry of the moved column.
+        /// Parallel API to `removeComponent`.
+        /// Returns `true` if the flag was removed, `false` if it was
+        /// not registered (idempotent no-op).
+        pub fn removeFlag(alloc: Allocator, comptime flag: @EnumLiteral()) Error!bool {
+            if (!initialized) return Error.NotInitialized;
+            const key = comptime enumFlagKey(flag);
+            const idx = flag_map.get(key) orelse return false;
+            _ = flag_map.remove(key);
+            var gone = flag_cols.swapRemove(idx);
+            if (idx < flag_cols.items.len) {
+                try flag_map.put(alloc, flag_cols.items[idx].name, idx);
+            }
+            gone.tree.deinit(alloc);
+            alloc.free(gone.name);
+            return true;
+        }
+
+        /// Checks registration of an `@EnumLiteral()` flag.
+        /// Parallel API to `containComponent`.
+        pub fn containFlag(comptime flag: @EnumLiteral()) bool {
+            if (!initialized) return false;
+            return flag_map.contains(comptime enumFlagKey(flag));
+        }
+
         /// Grows a payload buffer to `rows`, zeroing fresh bytes. The base
         /// is aligned manually inside an over-allocated `raw` slice, so any
         /// runtime `@alignOf(T)` works without comptime tricks.
@@ -599,13 +820,18 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         /// `values` may be a tuple or a single component value:
         /// `create(alloc, .{ Transform{ .scale = ... } })` or
         /// `create(alloc, Transform{ .scale = ... })`, likewise
-        /// `create(alloc, .{ Tag{} })` or `create(alloc, Tag{})`.
+        /// `create(alloc, .{ Tag{} })` or `create(alloc, Tag{})`,
+        /// and the same with `@EnumLiteral()` flags:
+        /// `create(alloc, .{ .my_flag })` or `create(alloc, .my_flag)`.
+        /// Tuples may mix struct values and enum flags at any depth.
         pub fn create(alloc: Allocator, values: anytype) Error!EntityReference {
             const V = @TypeOf(values);
             const ti = @typeInfo(V);
             if (ti == .@"struct" and ti.@"struct".is_tuple) {
                 return createChecked(alloc, values);
             } else if (ti == .@"struct") {
+                return createChecked(alloc, .{values});
+            } else if (ti == .enum_literal) {
                 return createChecked(alloc, .{values});
             } else {
                 @compileError("ECSTable.create(alloc, values): `values` must be a tuple of component values or a single component value, e.g. `.{ Transform{ .scale = ... } }` or `Transform{ .scale = ... }`; got `" ++ @typeName(V) ++ "`.");
@@ -643,7 +869,7 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         pub fn createN(alloc: Allocator, values: anytype, n: u32, context: anytype, comptime cb: fn (@TypeOf(context), EntityReference) void) Error!void {
             const V = @TypeOf(values);
             const ti = @typeInfo(V);
-            if (ti != .@"struct") {
+            if (ti != .@"struct" and ti != .enum_literal) {
                 @compileError("ECSTable.createN(alloc, values, n, ...): `values` must be a tuple of component values or a single component value, e.g. `.{ Transform{ .scale = ... } }` or `Transform{ .scale = ... }`; got `" ++ @typeName(V) ++ "`.");
             } else {
                 if (!initialized) return Error.NotInitialized;
@@ -720,12 +946,14 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         /// `Excludes` component enabled.
         ///
         /// `Includes`/`Excludes` accept nested groups: tuples may contain
-        /// component types or other tuples, e.g. `const g = .{ A, B };` then
-        /// `Query(.{ g, C }, ...)`. A single component type may pass bare,
-        /// without a tuple: `Query(A, .{})` means the same as `Query(.{A}, .{})`.
+        /// component types, `@EnumLiteral()` flags, or other tuples, e.g.
+        /// `const g = .{ A, .my_flag };` then `Query(.{ g, C }, ...)`.
+        /// A single component type or flag may pass bare, without a tuple:
+        /// `Query(A, .{})` means the same as `Query(.{A}, .{})`, and
+        /// `Query(.my_flag, .{})` means the same as `Query(.{.my_flag}, .{})`.
         /// Groups expand depth-first into one flat list, empty groups vanish,
-        /// duplicate types dedup silently.
-        /// A type listed on both sides is a comptime error.
+        /// duplicate leaves dedup silently (struct types by `==`, enum flags
+        /// by tag name). A leaf listed on both sides is a comptime error.
         ///
         /// Idioms, no second callback needed:
         /// - entities with A and B but not C: Includes={A,B}, Excludes={C}.
@@ -771,7 +999,7 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
                         var cursor: usize = 0;
                         inline for (0..NI) |i| {
                             if (comptime isFirstQueryOccurrence(NormI, i)) {
-                                inc[cursor] = try Table.componentTree(queryLeafAt(NormI, i));
+                                inc[cursor] = try Table.queryLeafTreeAt(NormI, i);
                                 cursor += 1;
                             }
                         }
@@ -782,7 +1010,7 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
                         var cursor: usize = 0;
                         inline for (0..NE) |i| {
                             if (comptime isFirstQueryOccurrence(NormE, i)) {
-                                exc[cursor] = try Table.componentTree(queryLeafAt(NormE, i));
+                                exc[cursor] = try Table.queryLeafTreeAt(NormE, i);
                                 cursor += 1;
                             }
                         }
@@ -819,32 +1047,47 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
             validateQuerySide(Excludes, "Excludes");
         }
 
-        /// One side of a query: tuple/group passes through, a bare type is
-        /// wrapped into a 1-tuple downstream; anything else (e.g. a component
-        /// value or a number) is a comptime error.
+        /// One side of a query: tuple/group passes through, a bare type or
+        /// bare `@EnumLiteral()` flag is wrapped into a 1-tuple downstream;
+        /// anything else (e.g. a component value or a number) is a comptime
+        /// error.
         fn validateQuerySide(S: anytype, comptime side: []const u8) void {
             const T = @TypeOf(S);
             if (comptime isTuple(T)) return;
             if (comptime T == type) return;
+            if (comptime @typeInfo(T) == .enum_literal) return;
             if (comptime @typeInfo(T) == .@"struct") @compileError("ECSTable.Query(...): `" ++ side ++ "` takes component TYPES, not values; pass `" ++ @typeName(T) ++ "` instead of `" ++ @typeName(T) ++ "{ ... }`.");
-            @compileError("ECSTable.Query(...): `" ++ side ++ "` must be a tuple of component types, a single component type, or a nested group; got `" ++ @typeName(T) ++ "`.");
+            @compileError("ECSTable.Query(...): `" ++ side ++ "` must be a tuple of component types, @EnumLiteral() flags, a single component type/flag, or a nested group; got `" ++ @typeName(T) ++ "`.");
         }
 
-        /// Cross-side check over nested groups: any leaf type present on
-        /// both sides is a comptime error. Duplicates inside each side are
-        /// deduped silently on fill instead.
+        /// Cross-side check over nested groups: any leaf present on both
+        /// sides is a comptime error, compared by storage key so struct
+        /// types and enum flags (same type, different tag names) are
+        /// distinguished. Duplicates inside each side are deduped
+        /// silently on fill instead.
         fn validateQueryCross(Inc: anytype, Exc: anytype) void {
             const ni = comptime countQueryLeaves(Inc);
+            const ne = comptime countQueryLeaves(Exc);
             inline for (0..ni) |i| {
-                const C = comptime queryLeafAt(Inc, i);
-                if (comptime queryContains(Exc, C)) @compileError("component type in both Includes and Excludes");
+                const key = comptime queryLeafKeyAt(Inc, i);
+                inline for (0..ne) |j| {
+                    if (comptime std.mem.eql(u8, queryLeafKeyAt(Exc, j), key)) @compileError("component in both Includes and Excludes");
+                }
             }
         }
 
         /// Query tuple elements must be struct types, values are rejected.
+        /// Kept `type`-only; `@EnumLiteral()` leaves go via `checkQueryFlag`.
         fn checkQueryType(X: anytype) void {
             if (@TypeOf(X) != type) @compileError("query tuples hold component types, not values");
             if (@typeInfo(X) != .@"struct") @compileError("component must be a struct type");
+        }
+
+        /// Query tuple `@EnumLiteral()` leaves are always well-formed:
+        /// identity is the tag name, registration is checked at
+        /// `iterateAll` time via `ComponentNotFound`.
+        fn checkQueryFlag(flag: @EnumLiteral()) void {
+            _ = flag;
         }
 
         /// Dead slot marker: sealed slots never point at rows again.
@@ -878,11 +1121,13 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
             indirection.items[s_v] = dead_slot;
         }
 
-        /// Comptime shape check of a create tuple: tuple-ness, struct
-        /// values only (payload or flag), nested groups expanded via the
-        /// `countValueLeaves`/`valueLeafTypeAt` flat view. Duplicate data
-        /// types are comptime errors; duplicate flags are allowed
-        /// (idempotent setBit).
+        /// Comptime shape check of a create tuple: struct values (payload
+        /// or flag) and `@EnumLiteral()` flags, nested groups expanded via
+        /// the `countValueLeaves`/`valueLeafTypeAt` flat view. Duplicate
+        /// data types are comptime errors; duplicate flags of either kind
+        /// are allowed (idempotent setBit). All enum literals share one
+        /// type, so enum leaves are skipped here: any number of them is
+        /// legal, dedup happens silently at activation.
         fn validateTuple(values: anytype) void {
             const ti = @typeInfo(@TypeOf(values));
             if (ti != .@"struct" or !ti.@"struct".is_tuple) @compileError("create expects a tuple of component values");
@@ -896,10 +1141,13 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
             const N = comptime countValueLeaves(TT);
             inline for (0..N) |k| {
                 const F = comptime valueLeafTypeAt(TT, k);
-                if (@typeInfo(F) != .@"struct") @compileError("tuple element must be a component struct value");
-                if (comptime isTuple(F)) @compileError("tuple element must be a component struct value");
+                if (comptime @typeInfo(F) == .enum_literal) continue;
+                if (@typeInfo(F) != .@"struct") @compileError("tuple element must be a component struct value or @EnumLiteral() flag");
+                if (comptime isTuple(F)) @compileError("tuple element must be a component struct value or @EnumLiteral() flag");
                 inline for (0..k) |j| {
-                    if (comptime valueLeafTypeAt(TT, j) == F) {
+                    const G = comptime valueLeafTypeAt(TT, j);
+                    if (comptime @typeInfo(G) == .enum_literal) continue;
+                    if (comptime G == F) {
                         if (comptime hasFields(F)) @compileError("duplicate component type in create tuple");
                     }
                 }
@@ -907,12 +1155,16 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         }
 
         /// Registration check over nested groups: `isTuple` first so empty
-        /// groups vanish instead of hitting the flag path. Leaves keep the
-        /// same `ComponentNotFound` contract as flat tuples.
+        /// groups vanish instead of hitting the flag path. Struct leaves
+        /// use `containComponent`, `@EnumLiteral()` leaves use
+        /// `containFlag`. Leaves keep the same `ComponentNotFound`
+        /// contract as flat tuples.
         fn ensureRegistered(values: anytype) Error!void {
             inline for (values) |v| {
                 if (comptime isTuple(@TypeOf(v))) {
                     try ensureRegistered(v);
+                } else if (comptime isEnumType(@TypeOf(v))) {
+                    if (!containFlag(v)) return Error.ComponentNotFound;
                 } else {
                     if (!containComponent(@TypeOf(v))) return Error.ComponentNotFound;
                 }
@@ -921,11 +1173,15 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
 
         /// Payload copy over nested groups without materializing a flat
         /// tuple: leaves are copied straight from their nested slots into
-        /// the column, one `memcpy` per data leaf, `setBit` per flag leaf.
+        /// the column, one `memcpy` per data leaf, `setBit` per flag leaf
+        /// (struct flags and `@EnumLiteral()` flags alike).
         fn activateRowValues(row: u32, values: anytype) Error!void {
             inline for (values) |v| {
                 if (comptime isTuple(@TypeOf(v))) {
                     try activateRowValues(row, v);
+                } else if (comptime isEnumType(@TypeOf(v))) {
+                    const tree = try enumFlagTree(v);
+                    tree.setBit(row, .active);
                 } else if (comptime hasFields(@TypeOf(v))) {
                     const col = try dataColumn(@TypeOf(v));
                     col.tree.setBit(row, .active);
@@ -1743,4 +1999,172 @@ test "ECSTable tag isolates instances" {
     try ea.destroy();
     try t.expect(!ea.isValid());
     try t.expect(eb.isValid());
+}
+
+test "ECSTable enum flags: add/remove/contain parallel API" {
+    const T = ECSTable(.t401);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    try t.expect(!T.containFlag(.flying));
+    try t.expect(try T.addFlag(t.allocator, .flying));
+    try t.expect(T.containFlag(.flying));
+    try t.expect(!T.containFlag(.swimming));
+    // Idempotent re-add is a no-op.
+    try t.expect(!try T.addFlag(t.allocator, .flying));
+    try t.expect(try T.addFlag(t.allocator, .swimming));
+    try t.expect(T.containFlag(.swimming));
+
+    // Struct flags and enum flags share flag_cols but never collide:
+    // Tag has @typeName key, .flying has "@EnumLiteral(.flying)" key.
+    try t.expect(try T.addComponent(t.allocator, Tag));
+    try t.expect(T.containComponent(Tag));
+    try t.expect(T.containFlag(.flying));
+
+    try t.expect(try T.removeFlag(t.allocator, .flying));
+    try t.expect(!T.containFlag(.flying));
+    try t.expect(T.containFlag(.swimming));
+    try t.expect(!try T.removeFlag(t.allocator, .flying));
+    // Struct flag untouched by enum removal.
+    try t.expect(T.containComponent(Tag));
+}
+
+test "ECSTable enum flags: create/set/activity mix with structs" {
+    const T = ECSTable(.t402);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Tag);
+    _ = try T.addFlag(t.allocator, .flying);
+    _ = try T.addFlag(t.allocator, .swimming);
+
+    // Mixed data + struct flag + enum flag in one tuple.
+    const e = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 2 }, Tag{}, .flying });
+    try t.expect(try e.isComponentActive(Pos));
+    try t.expect(try e.isComponentActive(Tag));
+    try t.expect(try e.isFlagActive(.flying));
+    try t.expect(!try e.isFlagActive(.swimming));
+    try t.expect(!try T.Row.isFlagActive(0, .swimming));
+
+    // Bare enum flag behaves like bare Tag{}.
+    const f = try T.create(t.allocator, .flying);
+    try t.expect(try f.isFlagActive(.flying));
+    try t.expect(!try f.isComponentActive(Pos));
+
+    // setComponent with enum only sets the bit.
+    const g = try T.create(t.allocator, .{});
+    try t.expect(!try g.isFlagActive(.swimming));
+    try g.setComponent(.swimming);
+    try t.expect(try g.isFlagActive(.swimming));
+    try T.Row.setComponent(2, .flying);
+    try t.expect(try T.Row.isFlagActive(2, .flying));
+
+    // setFlag / setFlagActivity sugar (Row + EntityReference).
+    try T.Row.setFlagActivity(0, .swimming, .active);
+    try t.expect(try T.Row.isFlagActive(0, .swimming));
+    try e.setFlag(.swimming);
+    try t.expect(try e.isFlagActive(.swimming));
+    try e.setFlagActivity(.swimming, .inactive);
+    try t.expect(!try e.isFlagActive(.swimming));
+
+    // Duplicate enum flags dedup silently, like struct flags.
+    const h = try T.create(t.allocator, .{ .flying, .{.flying} });
+    try t.expect(try h.isFlagActive(.flying));
+
+    // Nested groups mix structs and enums depth-first.
+    const base = .{ Pos{ .x = 3, .y = 4 }, .flying };
+    const i = try T.create(t.allocator, .{ base, Tag{}, .{ .swimming, .{} } });
+    try t.expect(try i.isComponentActive(Pos));
+    try t.expect(try i.isComponentActive(Tag));
+    try t.expect(try i.isFlagActive(.flying));
+    try t.expect(try i.isFlagActive(.swimming));
+
+    // Unregistered enum reports ComponentNotFound everywhere.
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{.ghost}));
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{ Pos{ .x = 0, .y = 0 }, .{.ghost} }));
+    try t.expectError(T.Error.ComponentNotFound, e.setFlagActivity(.ghost, .active));
+    try t.expectError(T.Error.ComponentNotFound, T.Row.isFlagActive(0, .ghost));
+
+    // createN with bare enum flag.
+    const Ctx = struct {
+        count: u32 = 0,
+        last: T.EntityReference = .{ .slot = 0, .gen = 0 },
+        fn push(self: *@This(), ref: T.EntityReference) void {
+            self.count += 1;
+            self.last = ref;
+        }
+    };
+    var ctx = Ctx{};
+    try T.createN(t.allocator, .swimming, 2, &ctx, Ctx.push);
+    try t.expectEqual(@as(u32, 2), ctx.count);
+    try t.expect(try ctx.last.isFlagActive(.swimming));
+}
+
+test "ECSTable enum flags: Query mixed, nested, dedup, excludes" {
+    const T = ECSTable(.t403);
+    try T.init();
+    defer T.deinit(t.allocator);
+
+    _ = try T.addComponent(t.allocator, Pos);
+    _ = try T.addComponent(t.allocator, Vel);
+    _ = try T.addComponent(t.allocator, Tag);
+    _ = try T.addFlag(t.allocator, .flying);
+    _ = try T.addFlag(t.allocator, .swimming);
+
+    // Rows: 0:Pos+flying 1:Pos+Vel+flying+swimming 2:Vel+swimming 3:Pos+Tag.
+    _ = try T.create(t.allocator, .{ Pos{ .x = 0, .y = 0 }, .flying });
+    _ = try T.create(t.allocator, .{ Pos{ .x = 1, .y = 1 }, Vel{ .dx = 1, .dy = 1 }, .flying, .swimming });
+    _ = try T.create(t.allocator, .{ Vel{ .dx = 2, .dy = 2 }, .swimming });
+    _ = try T.create(t.allocator, .{ Pos{ .x = 3, .y = 3 }, Tag{} });
+
+    // Helpers see through nesting; enum identity is tag name, not type.
+    const g = .{ Pos, .flying };
+    try t.expectEqual(@as(usize, 2), T.countQueryLeaves(g));
+    try t.expect(T.queryContains(g, Pos));
+    try t.expect(!T.queryContains(g, Vel));
+    try t.expect(T.queryContainsFlag(g, .flying));
+    try t.expect(!T.queryContainsFlag(g, .swimming));
+    try t.expectEqual(@as(usize, 2), T.countUniqueQueryLeaves(.{ Pos, .{ Pos, .flying }, .flying }));
+    try t.expect(T.queryContainsFlag(.{ .{ .flying } }, .flying));
+
+    // Includes enum flag.
+    const Q1 = T.Query(.{.flying}, .{}, .forward, *Collect, Collect.push);
+    var c = Collect{};
+    try t.expect(try Q1.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 1 }, c.rows[0..c.n]);
+
+    // Mixed struct + enum includes.
+    const Q2 = T.Query(.{ Pos, .flying }, .{}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q2.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 1 }, c.rows[0..c.n]);
+
+    // Enum in excludes: Pos without swimming.
+    const Q3 = T.Query(.{Pos}, .{.swimming}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q3.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 3 }, c.rows[0..c.n]);
+
+    // Bare enum on both sides.
+    const Q4 = T.Query(.flying, .swimming, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q4.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{0}, c.rows[0..c.n]);
+
+    // Nested group with enum + dedup across levels.
+    const Q5 = T.Query(.{ g, .swimming }, .{}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q5.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{1}, c.rows[0..c.n]);
+
+    const Q6 = T.Query(.{ Pos, .{ Pos, .flying }, .flying }, .{}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expect(try Q6.iterateAll(&c, null, null, null));
+    try t.expectEqualSlices(u32, &[_]u32{ 0, 1 }, c.rows[0..c.n]);
+
+    // Unregistered enum in query reports ComponentNotFound at iterateAll.
+    const QGhost = T.Query(.{.ghost}, .{}, .forward, *Collect, Collect.push);
+    c = Collect{};
+    try t.expectError(T.Error.ComponentNotFound, QGhost.iterateAll(&c, null, null, null));
 }
