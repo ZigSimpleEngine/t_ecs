@@ -394,7 +394,7 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         fn hasFields(comptime T: type) bool {
             const ti = @typeInfo(T);
             if (ti != .@"struct") @compileError("component must be a struct type");
-            return ti.@"struct".fields.len > 0;
+            return ti.@"struct".field_names.len > 0;
         }
 
         /// True for tuple values/types (structs with `is_tuple`), including
