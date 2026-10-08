@@ -4,7 +4,7 @@ const ThisBuild = @This();
 
 pub const Options = struct {
     target: ?std.Build.ResolvedTarget = null,
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
     dependency_bit_tree: ?*std.Build.Module = null,
 
     pub fn initFromOptions(b: *std.Build) Options {
@@ -82,9 +82,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const mod_tests = b.addTest(.{
         .root_module = mod,

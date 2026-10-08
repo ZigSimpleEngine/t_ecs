@@ -607,9 +607,10 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         /// depth-first, empty groups contribute zero.
         pub fn countValueLeaves(comptime TupleType: type) usize {
             comptime var n: usize = 0;
-            inline for (@typeInfo(TupleType).@"struct".fields) |f| {
-                if (comptime isTuple(f.type)) {
-                    n += comptime countValueLeaves(f.type);
+            const info = @typeInfo(TupleType).@"struct";
+            inline for (info.field_names, info.field_types) |_, FieldType| {
+                if (comptime isTuple(FieldType)) {
+                    n += comptime countValueLeaves(FieldType);
                 } else {
                     n += 1;
                 }
@@ -622,13 +623,14 @@ pub fn ECSTable(comptime tag: @EnumLiteral()) type {
         /// payloads, the runtime walk reads leaves from nested slots.
         pub fn valueLeafTypeAt(comptime TupleType: type, comptime idx: usize) type {
             comptime var cur: usize = 0;
-            inline for (@typeInfo(TupleType).@"struct".fields) |f| {
-                if (comptime isTuple(f.type)) {
-                    const m = comptime countValueLeaves(f.type);
-                    if (idx < cur + m) return comptime valueLeafTypeAt(f.type, idx - cur);
+            const info = @typeInfo(TupleType).@"struct";
+            inline for (info.field_names, info.field_types) |_, FieldType| {
+                if (comptime isTuple(FieldType)) {
+                    const m = comptime countValueLeaves(FieldType);
+                    if (idx < cur + m) return comptime valueLeafTypeAt(FieldType, idx - cur);
                     cur += m;
                 } else {
-                    if (cur == idx) return f.type;
+                    if (cur == idx) return FieldType;
                     cur += 1;
                 }
             }
@@ -1735,7 +1737,7 @@ test "nested query helpers: flat view and dedup over 3+ levels" {
     try t.expectEqual(@as(usize, 0), T.countUniqueQueryLeaves(.{ .{}, .{} }));
 
     // Four levels of nesting.
-    const g4 = .{ .{ .{ .{Pos} } }, Vel };
+    const g4 = .{ .{.{.{Pos}}}, Vel };
     try t.expectEqual(@as(usize, 2), T.countQueryLeaves(g4));
     try t.expect(T.queryLeafAt(g4, 0) == Pos);
     try t.expect(T.queryLeafAt(g4, 1) == Vel);
@@ -1759,7 +1761,7 @@ test "nested query helpers: flat view and dedup over 3+ levels" {
     try t.expect(T.queryContains(g3, Tag));
     try t.expect(!T.queryContains(g3, Ghost));
     try t.expect(!T.queryContains(.{ .{}, .{ g1, .{} } }, Ghost));
-    try t.expect(T.queryContains(.{ .{ .{Ghost} } }, Ghost));
+    try t.expect(T.queryContains(.{.{.{Ghost}}}, Ghost));
 }
 
 test "nested value helpers: flat leaf types over 3+ levels" {
@@ -1768,7 +1770,7 @@ test "nested value helpers: flat leaf types over 3+ levels" {
     const VT = @TypeOf(.{
         Pos{ .x = 1, .y = 2 },
         .{ Vel{ .dx = 3, .dy = 4 }, Tag{} },
-        .{.{ Health{ .hp = 5 } }},
+        .{.{Health{ .hp = 5 }}},
         .{},
     });
     // Depth-first: Pos, Vel, Tag, Health.
@@ -1783,7 +1785,7 @@ test "nested value helpers: flat leaf types over 3+ levels" {
     try t.expectEqual(@as(usize, 1), T.countValueLeaves(@TypeOf(.{ .{}, Tag{} })));
 
     // Four levels, single leaf.
-    const Deep = @TypeOf(.{ .{ .{ .{Pos{ .x = 0, .y = 0 }} } } });
+    const Deep = @TypeOf(.{.{.{.{Pos{ .x = 0, .y = 0 }}}}});
     try t.expectEqual(@as(usize, 1), T.countValueLeaves(Deep));
     try t.expect(T.valueLeafTypeAt(Deep, 0) == Pos);
 }
@@ -1819,7 +1821,7 @@ test "ECSTable nested create: groups expand depth-first with payloads" {
     try t.expect(!try f.isComponentActive(Vel));
 
     // Duplicate flags across groups dedup silently (idempotent setBit).
-    const g = try T.create(t.allocator, .{ Tag{}, .{Tag{}, .{}} });
+    const g = try T.create(t.allocator, .{ Tag{}, .{ Tag{}, .{} } });
     try t.expect(try g.isComponentActive(Tag));
 
     // createN reuses the same nested group per entity.
@@ -1840,8 +1842,8 @@ test "ECSTable nested create: groups expand depth-first with payloads" {
     try t.expect(try ctx.last.isComponentActive(Tag));
 
     // Missing registration is still reported through nesting.
-    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{ .{Ghost{ .v = 1 }} }));
-    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{ Pos{ .x = 0, .y = 0 }, .{ .{Ghost{ .v = 2 }} } }));
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{.{Ghost{ .v = 1 }}}));
+    try t.expectError(T.Error.ComponentNotFound, T.create(t.allocator, .{ Pos{ .x = 0, .y = 0 }, .{.{Ghost{ .v = 2 }}} }));
 }
 
 test "ECSTable nested Query: groups, dedup, excludes at depth" {
@@ -1876,19 +1878,19 @@ test "ECSTable nested Query: groups, dedup, excludes at depth" {
     try t.expectEqualSlices(u32, &[_]u32{2}, c.rows[0..c.n]);
 
     // Nested group in Excludes.
-    const Q3 = T.Query(.{Pos}, .{ .{Vel} }, .forward, *Collect, Collect.push);
+    const Q3 = T.Query(.{Pos}, .{.{Vel}}, .forward, *Collect, Collect.push);
     c = Collect{};
     try t.expect(try Q3.iterateAll(&c, null, null, null));
     try t.expectEqualSlices(u32, &[_]u32{ 0, 4 }, c.rows[0..c.n]);
 
     // Deep nesting plus empty groups on both sides.
-    const Q4 = T.Query(.{ .{ .{Pos} }, .{} }, .{ .{ .{Health} } }, .forward, *Collect, Collect.push);
+    const Q4 = T.Query(.{ .{.{Pos}}, .{} }, .{.{.{Health}}}, .forward, *Collect, Collect.push);
     c = Collect{};
     try t.expect(try Q4.iterateAll(&c, null, null, null));
     try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, c.rows[0..c.n]);
 
     // Nested group passed whole, without an outer wrapper element.
-    const Q5 = T.Query(g, .{ .{Health} }, .forward, *Collect, Collect.push);
+    const Q5 = T.Query(g, .{.{Health}}, .forward, *Collect, Collect.push);
     c = Collect{};
     try t.expect(try Q5.iterateAll(&c, null, null, null));
     try t.expectEqualSlices(u32, &[_]u32{ 1, 2 }, c.rows[0..c.n]);
@@ -2126,7 +2128,7 @@ test "ECSTable enum flags: Query mixed, nested, dedup, excludes" {
     try t.expect(T.queryContainsFlag(g, .flying));
     try t.expect(!T.queryContainsFlag(g, .swimming));
     try t.expectEqual(@as(usize, 2), T.countUniqueQueryLeaves(.{ Pos, .{ Pos, .flying }, .flying }));
-    try t.expect(T.queryContainsFlag(.{ .{ .flying } }, .flying));
+    try t.expect(T.queryContainsFlag(.{.{.flying}}, .flying));
 
     // Includes enum flag.
     const Q1 = T.Query(.{.flying}, .{}, .forward, *Collect, Collect.push);
